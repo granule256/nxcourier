@@ -40,8 +40,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 
@@ -434,6 +437,65 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "nxc_see",
+        "description": (
+            "★ 看一眼主机现在的画面 —— 图片**直接返回给你**，不需要你再自己去打开文件。\n"
+            "内部一次做完：抓帧 → 从 SD 卡分块取回 → 降采样 → 作为图片交给你。\n"
+            "★ 一次调用 = 一轮推理。过去要三步（screen.capture → nxc_fetch → 打开本地文件）= 三轮。\n"
+            "参数（都可省）：\n"
+            "  layer      = 抓哪一层，默认 lcd（LCD 上实际显示的）。\n"
+            "  max_width  = 交付前缩到多宽，默认 640。缩到 640 宽时图片 token 约为 720p 的 1/4。\n"
+            "  timeout_ms = 单次抓帧超时毫秒，默认 5000。\n"
+            "★ 想「操作一下再看结果」请用 nxc_step —— 它把动和看并成一次调用。\n"
+            "★ 连不上时先想「主机是不是睡着了」（静置约 148 秒会自动睡、且不会自己醒），请人按一下电源键。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "layer": {"type": "string", "description": "lcd|default|screenshot|recording|lastframe，默认 lcd"},
+                "max_width": {"type": "integer", "description": "交付前缩到多宽（像素），默认 640；给 0 表示不缩"},
+                "timeout_ms": {"type": "integer", "description": "单次抓帧超时毫秒，默认 5000"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "nxc_step",
+        "description": (
+            "★★ 一步一往返：按一串键 → 等画面反应 → 抓图 → **把「动作之后」的画面直接返回给你**。\n"
+            "这是「边看边操作」的基本单元。一次调用替代原来的四步"
+            "（input.seq + wait_stable/wait_change + screen.capture + nxc_fetch）。\n"
+            "参数：\n"
+            "  steps      = 必填。动作串，与设备侧 input.seq 同一套写法：\n"
+            "               名字:毫秒;名字:毫秒…（分号分隔；WAIT:n 是纯等待）\n"
+            "               例：\"DRIGHT:150;A:120\"、\"A:120;WAIT:300;A:120\"\n"
+            "               可用键：A B X Y L R ZL ZR PLUS MINUS DUP DDOWN DLEFT DRIGHT LSTICK RSTICK HOME CAPTURE\n"
+            "  wait       = stable（默认，等画面停住 ⇒ 判断「加载完了没」）\n"
+            "               | change（画面一变就回 ⇒ 适合一直在动的游戏画面）\n"
+            "               | none（不等，按完立刻抓）\n"
+            "  timeout_ms = 等反应的最长毫秒，默认 10000。\n"
+            "  layer / max_width 同 nxc_see。\n"
+            "★ 动画循环的界面（例如游戏内）永远不会「稳定」⇒ 那种场合用 wait=change，别用默认的 stable。\n"
+            "★ 属于会动主机的操作（真的注入按键/摇杆）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "steps": {"type": "string", "description": "动作串，形如 DRIGHT:150;A:120"},
+                "wait": {
+                    "type": "string",
+                    "enum": ["stable", "change", "none"],
+                    "description": "等哪种反应，默认 stable",
+                },
+                "timeout_ms": {"type": "integer", "description": "等反应的最长毫秒，默认 10000"},
+                "layer": {"type": "string", "description": "lcd|default|screenshot|recording|lastframe，默认 lcd"},
+                "max_width": {"type": "integer", "description": "交付前缩到多宽，默认 640"},
+            },
+            "required": ["steps"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -814,6 +876,232 @@ def tool_fetch(device: Device, arguments: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------- 画面内联（让模型"真的看见")
+#
+# ★ 这一节解决的是「看一眼要花几轮推理」的问题，不是「画面传得够不够快」。
+#
+#   原来 AI 要看画面必须走三步：nxc_call screen.capture → nxc_fetch → 客户端再打开本地文件。
+#   每一步都是一轮模型推理。而实测（OSWorld-Human，arXiv:2506.16042）表明：这类循环里
+#   **模型推理占 75%~94% 的总延迟，截图捕获与动作执行合计不到 3%**
+#   ⇒ 该省的是「轮次」，不是「把管道做快」（把管道做快反而可能让 agent 重复看、重复动作）。
+#
+#   所以这里把「抓帧 → 取回 → 交付」合成**一次**调用，并把图**直接**放进 MCP 的 content 数组
+#   （`{"type":"image","data":<base64>,"mimeType":...}` —— MCP 官方规范里的标准 content block）。
+#
+# ★ 为什么仍然要经 SD 卡中转：设备侧单条应答上限是 `kReplyBytes = 32768` 字节，
+#   而一帧 720p JPEG 约 188KB ⇒ 塞不进应答，只能落卡再分块读回。
+#   （分块读回本身不慢：实测单次 `fs.read` 往返约 11.8ms，整帧约 80ms。）
+
+IMAGE_MAX_WIDTH_DEFAULT = 640
+SCREEN_REMOTE_PATH = "/config/nxc/screen.jpg"
+
+
+class Content(list):
+    """标记：这个返回值**本身**就是 MCP 的 content 数组，不要再被包成一段 text。
+
+    用 list 子类而不是普通 list —— 这样能跟"某个工具恰好返回了一个 list"区分开。
+    """
+
+
+def image_block(jpeg: bytes, mime: str = "image/jpeg") -> dict:
+    """一张图 → MCP 的 image content block。"""
+    return {
+        "type": "image",
+        "data": base64.b64encode(jpeg).decode("ascii"),
+        "mimeType": mime,
+    }
+
+
+def _downscale(jpeg: bytes, max_width: int) -> tuple[bytes, str]:
+    """把一帧缩到 max_width 宽。返回 (字节, 走的哪条路)。
+
+    ★ 为什么要缩：Anthropic 的图片 token 算法是 ⌈w/28⌉×⌈h/28⌉ ≈ w×h/750
+      ⇒ 1280×720 ≈ 1229 token，640×360 ≈ 307 token（约 1/4）。
+      官方文档也明说 "prefer resizing images before uploading them"。
+    ★ 三条路，依次尝试：
+      ① Pillow（若这个解释器装了）—— 快，还能控 JPEG 质量；
+      ② macOS 自带的 `sips` —— 不装任何东西就能用，实测一帧约 40ms；
+      ③ 都不行就原样返回，并在文本里如实说明（宁可显式降级，也不悄悄假装缩过）。
+    """
+    if max_width <= 0:
+        return jpeg, "disabled(未缩放)"
+
+    try:
+        from PIL import Image  # 局部导入：没装也不该影响其它工具
+    except ImportError:
+        Image = None  # type: ignore[assignment]
+
+    if Image is not None:
+        try:
+            import io
+
+            with Image.open(io.BytesIO(jpeg)) as im:
+                if im.width <= max_width:
+                    return jpeg, "pillow(本来就不宽)"
+                height = max(1, round(im.height * max_width / im.width))
+                resized = im.convert("RGB").resize((max_width, height), Image.LANCZOS)
+                buf = io.BytesIO()
+                resized.save(buf, format="JPEG", quality=72, optimize=True)
+                return buf.getvalue(), f"pillow({max_width}px)"
+        except Exception:  # noqa: BLE001 - 退到 sips，不要因为这个把工具弄崩
+            pass
+
+    sips = shutil.which("sips")
+    if sips:
+        try:
+            with tempfile.TemporaryDirectory(prefix="nxc-img-") as tmp:
+                src = Path(tmp) / "in.jpg"
+                dst = Path(tmp) / "out.jpg"
+                src.write_bytes(jpeg)
+                proc = subprocess.run(
+                    [sips, "-Z", str(max_width), "-s", "formatOptions", "normal",
+                     str(src), "--out", str(dst)],
+                    capture_output=True, timeout=10,
+                )
+                if proc.returncode == 0 and dst.is_file() and dst.stat().st_size > 0:
+                    return dst.read_bytes(), f"sips({max_width}px)"
+        except Exception:  # noqa: BLE001
+            pass
+
+    return jpeg, "none(没装 Pillow 也没有 sips，未缩放)"
+
+
+def _device_line(method: str, params: dict) -> str:
+    """拼一条协议行（与 tool_call 同一套转义规则）。值为 None 的参数直接省略。"""
+    parts = [method]
+    for key, value in params.items():
+        if value is None:
+            continue
+        parts.append(f"{key}={escape_value(str(value))}")
+    return " ".join(parts)
+
+
+def _grab_frame(device: Device, layer: str | None, timeout_ms: int,
+                remote_path: str) -> tuple[bytes | None, list[str]]:
+    """抓一帧并拉回本地。返回 (JPEG 字节 或 None, 过程记事)。"""
+    notes: list[str] = []
+    params: dict = {"path": remote_path}
+    if layer:
+        params["layer"] = layer
+    if timeout_ms:
+        params["timeout_ms"] = timeout_ms
+
+    captured = device.call_one(_device_line("screen.capture", params))
+    if "error" in captured:
+        err = captured["error"]
+        notes.append(f"screen.capture 失败：{err.get('code')} {err.get('message')}")
+        return None, notes
+
+    payload = parse_payload(captured.get("lines", []))
+    row = payload[0] if payload and isinstance(payload[0], dict) else {}
+    notes.append(f"抓帧 {row.get('bytes', '?')} 字节 via={row.get('via', '?')} magic={row.get('magic', '?')}")
+
+    jpeg = read_remote_file(device, remote_path)
+    if not jpeg:
+        notes.append("从设备取回 0 字节（读通道问题，再试一次通常就好）")
+        return None, notes
+    return jpeg, notes
+
+
+_DEVICE_ASLEEP_HINT = (
+    "★ 主机静置约 148 秒会自己睡着，而且睡着之后不会自己醒 —— 读不到画面最常见的原因就是这个。"
+    "请人按一下电源键唤醒，再试一次（不要当网络故障去排查）。"
+)
+
+
+def tool_see(device: Device, arguments: dict):
+    """★ 看一眼主机现在的画面 —— 图片直接返回给模型。
+
+    一次调用顶过去三步（screen.capture → nxc_fetch → 客户端打开本地文件）。
+    """
+    layer = arguments.get("layer")
+    timeout_ms = int(arguments.get("timeout_ms") or 5000)
+    max_width = arguments.get("max_width")
+    max_width = IMAGE_MAX_WIDTH_DEFAULT if max_width is None else int(max_width)
+    remote_path = arguments.get("path") or SCREEN_REMOTE_PATH
+
+    jpeg, notes = _grab_frame(device, layer, timeout_ms, remote_path)
+    if jpeg is None:
+        return {"error": "capture-failed", "notes": notes, "hint": _DEVICE_ASLEEP_HINT}
+
+    small, via = _downscale(jpeg, max_width)
+    notes.append(f"交付尺寸：{via}，{len(jpeg)} → {len(small)} 字节")
+
+    return Content([
+        {"type": "text", "text": "主机画面（下面这张图就是当前屏幕）：\n" + "\n".join(notes)},
+        image_block(small),
+    ])
+
+
+def tool_step(device: Device, arguments: dict):
+    """★★ 一步一往返：按一串键 → 等画面反应 → 抓图 → 把「动作之后」的画面交给模型。
+
+    这是「边看边操作」的基本单元。一次调用替代原来的四步：
+    input.seq + screen.wait_stable/wait_change + screen.capture + nxc_fetch。
+    """
+    steps = arguments.get("steps")
+    if not steps:
+        raise RuntimeError(
+            "缺少 steps。动作串写法与设备侧 input.seq 相同："
+            "名字:毫秒;名字:毫秒…（分号分隔，WAIT:n 是纯等待），例如 DRIGHT:150;A:120")
+
+    wait = str(arguments.get("wait") or "stable")
+    if wait not in ("stable", "change", "none"):
+        raise RuntimeError("wait 只能是 stable / change / none")
+
+    timeout_ms = int(arguments.get("timeout_ms") or 10000)
+    layer = arguments.get("layer")
+    max_width = arguments.get("max_width")
+    max_width = IMAGE_MAX_WIDTH_DEFAULT if max_width is None else int(max_width)
+
+    notes: list[str] = []
+
+    # ① 动作
+    act = device.call_one(_device_line("input.seq", {"steps": steps}))
+    if "error" in act:
+        err = act["error"]
+        return {
+            "error": "input.seq-failed",
+            "code": err.get("code"),
+            "message": err.get("message"),
+            "hint": "动作串里出现不认识的键名时会回错。可用 nxc_call 调 input.status 看可用键名。",
+        }
+    act_payload = parse_payload(act.get("lines", []))
+    arow = act_payload[0] if act_payload and isinstance(act_payload[0], dict) else {}
+    notes.append(f"动作已下发：steps={arow.get('steps', '?')} elapsed_ms={arow.get('elapsed_ms', '?')}")
+
+    # ② 等画面反应（设备端连着抓帧比对，不是盲等固定秒数）
+    if wait != "none":
+        method = "screen.wait_stable" if wait == "stable" else "screen.wait_change"
+        waited = device.call_one(_device_line(method, {"timeout_ms": timeout_ms, "layer": layer}))
+        if "error" in waited:
+            notes.append(f"{method} 失败：{waited['error'].get('message')}")
+        else:
+            wp = parse_payload(waited.get("lines", []))
+            wrow = wp[0] if wp and isinstance(wp[0], dict) else {}
+            if wait == "stable":
+                verdict = ("画面已停住（加载/过渡结束）" if wrow.get("stable") == "1"
+                           else f"超时前画面一直没停（{timeout_ms}ms —— 动画界面永远不会稳定，这种场合请用 wait=change）")
+            else:
+                verdict = ("画面确实变了" if wrow.get("changed") == "1"
+                           else f"超时内画面没动（{timeout_ms}ms）")
+            notes.append(f"等待结果：{verdict} frames={wrow.get('frames', '?')} elapsed_ms={wrow.get('elapsed_ms', '?')}")
+
+    # ③ 抓图 + ④ 交付（图片本身）
+    jpeg, grab_notes = _grab_frame(device, layer, 5000, SCREEN_REMOTE_PATH)
+    notes.extend(grab_notes)
+    if jpeg is None:
+        return {"error": "capture-failed", "notes": notes, "hint": _DEVICE_ASLEEP_HINT}
+
+    small, via = _downscale(jpeg, max_width)
+    notes.append(f"交付尺寸：{via}，{len(jpeg)} → {len(small)} 字节")
+
+    return Content([
+        {"type": "text", "text": "动作已完成。下面这张图是**动作之后**的画面：\n" + "\n".join(notes)},
+        image_block(small),
+    ])
+
+
 # ---------------------------------------------------------------- JSON-RPC 层
 def rpc_result(req_id, result) -> dict:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
@@ -866,6 +1154,10 @@ def handle(request: dict, device: Device) -> dict | None:
                 payload = tool_fetch(device, arguments)
             elif name == "nxc_put":
                 payload = tool_put(device, arguments)
+            elif name == "nxc_see":
+                payload = tool_see(device, arguments)
+            elif name == "nxc_step":
+                payload = tool_step(device, arguments)
             else:
                 return rpc_result(req_id, {
                     "content": [{"type": "text", "text": f"未知工具：{name}"}],
@@ -877,6 +1169,12 @@ def handle(request: dict, device: Device) -> dict | None:
                 "content": [{"type": "text", "text": f"执行失败：{type(exc).__name__}: {exc}"}],
                 "isError": True,
             })
+
+        # ★★★ 2026-10-08：图片类工具（nxc_see / nxc_step）返回的是 Content 标记对象 ——
+        #   它**本身**就是 MCP 的 content 数组，不能再被 json.dumps 包成一段文本
+        #   （那样图片会退化成一大坨 base64 文本，等于白做）。
+        if isinstance(payload, Content):
+            return rpc_result(req_id, {"content": list(payload)})
 
         is_error = isinstance(payload, dict) and "error" in payload
         text = json.dumps(payload, ensure_ascii=False, indent=2)
