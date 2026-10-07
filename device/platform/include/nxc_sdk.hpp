@@ -31,8 +31,15 @@
 namespace nxc {
 
 // 平台版本。工具可以拿它上报，便于 PC 侧判断对端能力。
+//
+// ★ 版本号的**单一来源是仓库根目录的 `VERSION` 文件** —— 构建时由 Makefile 读出来，
+//   以 `-DNXC_VERSION="x.y.z"` 注入。下面这个 `#ifndef` 只是"没走 Makefile 单独编译"
+//   时的兜底：回落值故意带 `-unpinned` 后缀，好在 `identify.id` 里一眼看出没接上。
+#ifndef NXC_VERSION
+#define NXC_VERSION "1.0.0-unpinned"
+#endif
 inline constexpr const char* kPlatformName    = "nxc";
-inline constexpr const char* kPlatformVersion = "0.1.0";
+inline constexpr const char* kPlatformVersion = NXC_VERSION;
 
 // ★★ 平台自己的 Title ID 与内容目录。
 //   **必须和 device/platform/config.json 里的 title_id、以及 SD 卡上的目录名完全一致**，

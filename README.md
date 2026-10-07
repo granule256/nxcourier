@@ -1,5 +1,8 @@
 # NxCourier
 
+当前版本 **v1.0.0**。版本号的单一来源是仓库根目录的 [`VERSION`](VERSION)：设备侧由 Makefile
+在构建时注入（`identify.id` 报的 `version=` 就是它），PC 侧的 MCP 服务器读同一个文件。
+
 在一台装了 **[Atmosphère](https://github.com/Atmosphere-NX/Atmosphere)**（开源自制系统）的主机上常驻一个
 自写的系统模块（sysmodule），把主机能力暴露成一条**行文本协议**的网络接口。局域网里的 PC 脚本与 AI
 客户端通过它读状态、读写 SD 卡、模拟按键、抓画面、重启主机，不需要额外的桌面端工具，也不需要拔卡。
@@ -50,17 +53,16 @@
 ## 构建
 
 ```bash
-cd device/platform
-
 # 本机装了 devkitPro：
-make -j4
+cd device/platform && make -j4
 
 # 没装 devkitPro（走 docker）：
-docker run --rm -v "$PWD":/work -w /work devkitpro/devkita64:latest \
+# ★ 请在仓库根目录下执行，并把「根目录」挂进容器 —— Makefile 要从根目录的 VERSION 取版本号。
+docker run --rm -v "$PWD":/work -w /work/device/platform devkitpro/devkita64:latest \
   bash -lc '. /opt/devkitpro/devkita64.sh && make -j4'
 ```
 
-产出 `nxc.nsp`（ExeFS PFS0 格式）。`device/platform/dist/` 里另放了一份已验证可用的构建产物，可以直接用。
+产出 `nxc.nsp`（ExeFS PFS0 格式）。`device/platform/dist/` 里另放了一份可以直接使用的构建产物。
 救生艇是独立的小程序，在 `tools/nxc-recovery/` 里用同样的命令构建。
 
 ## 装到卡上

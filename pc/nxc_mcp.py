@@ -47,7 +47,22 @@ from pathlib import Path
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "nxc-platform"
-SERVER_VERSION = "0.1.0"
+
+
+def _read_version() -> str:
+    """版本号的单一来源是仓库根目录的 VERSION 文件（与设备侧同一个文件）。
+
+    取不到就回落到一个显眼的占位值 —— 宁可报一个"明显是假"的版本，
+    也不要悄悄报一个看起来正常的错版本。
+    """
+    try:
+        path = Path(__file__).resolve().parent.parent / "VERSION"
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "0.0.0-unknown"
+
+
+SERVER_VERSION = _read_version()
 
 DEFAULT_IP = os.environ.get("NXC_DEVICE_IP", "192.168.1.50")
 DEFAULT_PORT = int(os.environ.get("NXC_DEVICE_PORT", "47800"))

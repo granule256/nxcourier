@@ -28,13 +28,20 @@ description: 对 NxCourier 平台（自制系统主机上的自写 sysmodule）�
 ## 二 构建
 
 ```bash
-cd ~/code/github/NXC/device/platform
-docker run --rm -v "$PWD":/work -w /work devkitpro/devkita64:latest \
+# ★ 必须在仓库根目录下跑：Makefile 要从根目录的 VERSION 取版本号，
+#   所以挂载点也必须是根目录。只挂 device/platform 的话容器里看不到 VERSION，
+#   构建会回落成带 `-unpinned` 后缀的版本号（一眼能看出没接上，不会悄悄报错版本）。
+cd ~/code/github/NXC
+docker run --rm -v "$PWD":/work -w /work/device/platform devkitpro/devkita64:latest \
   bash -lc '. /opt/devkitpro/devkita64.sh && make -j4 2>&1 | grep -vE "field not present" | tail -12'
 ```
 
 ★ 判据不是"零警告"：那串 `field not present` 是**无害噪音**（官方模板同样报）。
-★ 看工具数：`aarch64-none-elf-objdump -h nxc.elf | grep nxc_tools`，段大小 ÷ 32 = 工具数。
+★ 看工具数：`aarch64-none-elf-objdump -h nxc.elf | grep nxc_tools`，
+  段大小 ÷ **40**（`nxc::Tool` 结构体的大小）= 工具数。当前 `0x230` = 560 ÷ 40 = **14** 个。
+  （★ 旧文档写的"÷ 32"是结构体还是 32 字节时的算法，**已经过期**，照它会算出 17.5。）
+★ 顺带确认版本号接上了：`strings nxc.nso | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$'` ——
+  出现 `-unpinned` 就说明 `VERSION` 没读到。
 
 ## 三 留备份（改设备侧代码时必做）
 

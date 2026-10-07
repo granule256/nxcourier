@@ -31,6 +31,26 @@ SOURCES     :=  source source/core source/tools
 DATA        :=  data
 INCLUDES    :=  include source/core
 
+# ---- 版本号：单一来源是仓库根目录的 VERSION ----
+#   ★ 路径层级：Makefile 在 `device/platform/`，VERSION 在仓库根 ⇒ 相对路径是
+#     **`../../VERSION`**。`../VERSION` 只是 `device/VERSION`，那儿没这个文件。
+#   ★ 本文件会被递归调用两次（先在 device/platform 里、再在 build/ 里），子调用的 CURDIR
+#     已经变成 build/，`../../` 就指偏了 —— 所以**只在父调用里读一次、然后导出**，
+#     子调用直接用环境里的值（父调用跑完整个文件后才发起子 make，导出一定已经生效）。
+#   ★ 走 docker 时**必须把仓库根目录挂进容器**
+#     （`-v <仓库根>:/work -w /work/device/platform`）：只挂 device/platform 的话，
+#     仓库根在容器里根本不存在，读不到 VERSION。
+#   ★ 读不到就不注入 —— 头文件里的兜底值带 `-unpinned` 后缀，一眼能看出没接上，
+#     不会悄悄报一个看起来正常的错版本。
+NXC_VERSION_FILE ?= $(CURDIR)/../../VERSION
+ifeq ($(NXC_VERSION),)
+    NXC_VERSION := $(shell cat $(NXC_VERSION_FILE) 2>/dev/null)
+    export NXC_VERSION
+endif
+ifneq ($(strip $(NXC_VERSION)),)
+    DEFINES += -DNXC_VERSION='"$(NXC_VERSION)"'
+endif
+
 ARCH    :=  -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
 CFLAGS  :=  -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES)
