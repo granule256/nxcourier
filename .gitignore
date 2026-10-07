@@ -1,0 +1,66 @@
+# ================================================================
+# NxCourier —— 仓库排除规则
+#
+# 原则：**仓库里只留「产品本身」——
+#       源码 + README + 要留档的成品**；
+#       开发过程材料、测试脚本、只对本机有意义的东西一律不入库
+#       （它们仍然留在磁盘上，只是不被 git 跟踪）。
+#
+# ★ 注意：带 `/` 前缀的规则才锚定在仓库根；不写会匹配任意层级同名目录。
+# ================================================================
+
+# ---- 开发过程材料：只留档在本机 ----
+#   docs/ 是过程记录（交接报告、需求分析、开工单、原始回包日志、改动日志…）。
+#   ★ 想让某篇文档进仓库：把它挪到 docs/ 之外，或删掉下面这行。
+/docs/
+#   tests/ 是宿主侧单测与门禁、dead-end/ 是没走通的废弃方案 —— 都不属于产品。
+device/platform/tests/
+device/platform/dead-end/
+
+# ---- 测试 / 一次性验收脚本（不是产品功能）----
+pc/nxc_accept_space_fix.py
+pc/nxc_codec_check.py
+pc/nxc_mcp_selftest.py
+pc/nxc_mcp_deadconn_test.py
+pc/nxc_nvnflinger_cmu.py
+
+# ---- 本机现场材料 ----
+#   事故取证留档（崩溃转储、系统模块日志）、救急包、下载物、临时目录。
+#   ★ 取证材料是崩溃转储 + 系统模块的内存镜像，不适合入库。
+/事故取证-*/
+/救急包/
+/tmp/
+
+# ---- 本机工具目录（工作记录、本机技能定义等，只对本机有意义）----
+/.workbuddy/
+
+# ---- 构建中间产物（都能重新生成）----
+device/platform/build/
+device/platform/nxc.elf
+device/platform/nxc.nso
+device/platform/nxc.nsp
+device/platform/nxc.npdm
+device/platform/nxc.map
+
+tools/nxc-recovery/build/
+tools/nxc-recovery/*.elf
+tools/nxc-recovery/*.nacp
+
+# ---- 产物目录：只留「当前那一份」----
+#   device/platform/dist/exefs.nsp 是"设备上到底在跑哪一版"的凭据（靠 sha256），入库；
+#   逐次构建的备份属本机回退材料，不入库。
+#   ★ 顶层的 /dist/ 是改名前的旧产物堆放处，整目录不入库。
+/dist/
+device/platform/dist/backup/
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
