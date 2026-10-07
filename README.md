@@ -204,7 +204,7 @@ skills/               本项目的开发流程约定（改动留痕、崩溃取�
 
 本项目以 **GNU General Public License v2.0**（`GPL-2.0-only`）发布，全文见 [`LICENSE`](LICENSE)。
 
-`Copyright (C) 2026 kelinls`
+`Copyright (C) 2026 granule256`
 
 你可以在 GPL-2.0 的条款下使用、修改、再分发；分发衍生作品时必须以同样的许可提供源码。
 
