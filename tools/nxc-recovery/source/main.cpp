@@ -6,7 +6,7 @@
 // 完整条款见仓库根目录的 LICENSE。
 // ================================================================
 
-// NxCourier 救生艇 —— 平台自己挂了的时候，用它把平台救回来。
+// NxCourier nxc-recovery —— 平台自己挂了的时候，用它把模块写回去。
 //
 // ## 为什么需要它（真实事故）
 //
@@ -158,7 +158,7 @@ int restore(const char* srcName, char* errBuf, size_t errCap) {
 
 void draw(int sel, const char* status) {
     consoleClear();
-    std::printf("NxCourier 救生艇\n");
+    std::printf("NxCourier nxc-recovery\n");
     std::printf("平台（47800）挂了的时候用它把模块写回去\n");
     std::printf("------------------------------------------------\n\n");
 

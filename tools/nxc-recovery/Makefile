@@ -6,7 +6,7 @@
 # 完整条款见仓库根目录的 LICENSE。
 # ================================================================
 
-# NxCourier 救生艇 · 构建（普通 NRO，不是 sysmodule）
+# NxCourier nxc-recovery · 构建（普通 NRO，不是 sysmodule）
 #
 # ★ 与平台那份的唯一区别：**这个目录里没有 config.json**，
 #   所以 Makefile 产出的是 `.nro`（普通自制软件），而不是 ExeFS PFS0。

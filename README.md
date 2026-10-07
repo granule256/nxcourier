@@ -63,7 +63,7 @@ docker run --rm -v "$PWD":/work -w /work/device/platform devkitpro/devkita64:lat
 ```
 
 产出 `nxc.nsp`（ExeFS PFS0 格式）。`device/platform/dist/` 里另放了一份可以直接使用的构建产物。
-救生艇是独立的小程序，在 `tools/nxc-recovery/` 里用同样的命令构建。
+`nxc-recovery` 是独立的小程序，在 `tools/nxc-recovery/` 里用同样的命令构建。
 
 ## 装到卡上
 
@@ -71,7 +71,7 @@ docker run --rm -v "$PWD":/work -w /work/device/platform devkitpro/devkita64:lat
 sdmc:/atmosphere/contents/4200000000000012/exefs.nsp         模块本体（nxc.nsp 改名而来）
 sdmc:/atmosphere/contents/4200000000000012/flags/boot2.flag  启动标记
 sdmc:/atmosphere/contents/4200000000000012/toolbox.json      可选，让它出现在 sysmodules 覆盖层里
-sdmc:/switch/nxc-recovery.nro                                可选，救生艇
+sdmc:/switch/nxc-recovery.nro                                可选
 ```
 
 `flags/boot2.flag` 不能省。少了它模块不会被加载，表现是「装好了但一点反应也没有」。
@@ -182,7 +182,7 @@ python3 pc/nxc.py --json 'identify.id'
 * 主机上若另跑着别的调试或传输组件（GDB 桩、FTP、视频流等），它们不属于本项目；其中 GDB 桩与
   本平台的 `mem.*` 互斥。
 
-## 救生艇
+## nxc-recovery
 
 `tools/nxc-recovery/` 是一个普通的 NRO 自制程序，不是系统模块，也不依赖 `47800` 或 FTP。它只做一件事：
 当平台把自己写坏、或者刷进一份不能用的版本时，把一份已知可用的模块写回模块目录并重启。
@@ -194,7 +194,7 @@ python3 pc/nxc.py --json 'identify.id'
 
 ```
 device/platform/      设备侧 sysmodule：源码（核心 + 各工具）、构建脚本、详细手册、一份已验证的产物
-tools/nxc-recovery/   救生艇
+tools/nxc-recovery/   独立小程序
 pc/                   PC 侧脚本与 MCP 服务器
 skills/               本项目的开发流程约定（改动留痕、崩溃取证工具链）
 ```
@@ -213,4 +213,4 @@ skills/               本项目的开发流程约定（改动留痕、崩溃取�
 ## 免责
 
 本项目是自制软件（homebrew）作品，只在你自己的设备上使用。修改系统模块有导致主机无法开机的风险，
-仓库里带了救生艇，但风险自负。本项目不包含任何厂商的专有代码或内容。
+仓库里带了 `nxc-recovery`，但风险自负。本项目不包含任何厂商的专有代码或内容。
