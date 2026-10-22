@@ -36,7 +36,7 @@ namespace nxc {
 //   以 `-DNXC_VERSION="x.y.z"` 注入。下面这个 `#ifndef` 只是"没走 Makefile 单独编译"
 //   时的兜底：回落值故意带 `-unpinned` 后缀，好在 `identify.id` 里一眼看出没接上。
 #ifndef NXC_VERSION
-#define NXC_VERSION "1.0.0-unpinned"
+#define NXC_VERSION "1.0.1-unpinned"
 #endif
 inline constexpr const char* kPlatformName    = "nxc";
 inline constexpr const char* kPlatformVersion = NXC_VERSION;
