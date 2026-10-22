@@ -556,6 +556,21 @@ int openListener() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 
+    // 网络状态可能在 poll 返回与 accept 之间变化；监听口不能阻塞整个服务循环。
+    // 设置失败时不继续使用阻塞 socket，交给调用方稍后重试。
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        log::ring("net: listener O_NONBLOCK failed errno=%d", errno);
+        ::close(fd);
+        return -1;
+    }
+    const int actualFlags = ::fcntl(fd, F_GETFL, 0);
+    if (actualFlags < 0 || !(actualFlags & O_NONBLOCK)) {
+        log::ring("net: listener O_NONBLOCK not retained flags=%d errno=%d", actualFlags, errno);
+        ::close(fd);
+        return -1;
+    }
+
     // ★ 照抄验证（`likedmnt2` 模式）：Atmosphère 的 dmnt.gen2 **不设** `SO_REUSEADDR`。
     //   其余模式保持原样（我们一直设着）。
     if (nxc::net::useReuseAddr()) {
@@ -638,7 +653,8 @@ void serveForever(int listenFd, bool keepListenerOpen) {
         //     这里是不成功时的重试，也是 `keepListenerOpen=true` 各模式唯一的重开路径）。
         //   ★ 原来这个条件里带了 `!keepListenerOpen` ⇒ **`listen` 模式下醒来若第一次重开失败，
         //     就再也不会重开**（端口永久消失、看起来像"模块挂了"）。现在去掉那个限制。
-        if (listener < 0 && activeClientCount() == 0) {
+        // listen 模式在已有客户端在线时也要恢复监听；acceptonly 才等全部断开。
+        if (listener < 0 && (keepListenerOpen || activeClientCount() == 0)) {
             listener = openListener();
             log::ring("net: listener reopened fd=%d", listener);
         }
@@ -695,15 +711,39 @@ void serveForever(int listenFd, bool keepListenerOpen) {
             }
             continue;
         }
-        if (ready < 0) continue;
+        if (ready < 0) {
+            const int pollError = errno;
+            if (pollError != EINTR) {
+                log::ring("net: poll failed errno=%d, retry after 100ms", pollError);
+                svcSleepThread(100000000ULL);
+            }
+            continue;
+        }
 
         for (int k = 0; k < n; ++k) {
-            if ((fds[k].revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+            if ((fds[k].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) == 0) continue;
 
             // ---- 新连接
             if (slots[k] < 0) {
+                // 错误/挂断不是“有连接可接收”。先释放失效监听口，下轮重建。
+                // 即使同时带 POLLIN，也不能在已失效的监听口上尝试 accept。
+                if (fds[k].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                    log::ring("net: listener events=0x%X, close and retry", fds[k].revents);
+                    ::close(listener);
+                    listener = -1;
+                    svcSleepThread(100000000ULL);
+                    continue;
+                }
+                if (!(fds[k].revents & POLLIN)) continue;
                 const int fd = ::accept(listener, nullptr, nullptr);
-                if (fd < 0) continue;
+                if (fd < 0) {
+                    const int acceptError = errno;
+                    if (acceptError != EAGAIN && acceptError != EWOULDBLOCK && acceptError != EINTR) {
+                        log::ring("net: accept failed errno=%d, retry after 100ms", acceptError);
+                        svcSleepThread(100000000ULL);
+                    }
+                    continue;
+                }
 
                 int slot = -1;
                 for (int i = 0; i < kMaxClients; ++i) {
