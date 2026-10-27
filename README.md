@@ -7,7 +7,7 @@
 当前设备源码提供 14 个工具 / 59 个方法（已安装版本以 `nxc caps` 为准），监听 TCP `47800`。PC 侧使用一个 `nxc` 入口和一个本机后台，
 CLI、MCP（8 个工具）和 Web 共用设备连接、FTP 客户端及 GDB 会话；无需额外桌面壳，也不用拔卡。
 
-当前 PC 版本 **v1.0.3**，版本号定义在仓库根目录的 [`VERSION`](VERSION)。设备源码与保留成品分开管理，区别见下方构建说明。
+当前版本 **v1.0.3**，用户安装包见 [GitHub Release](https://github.com/granule256/nxcourier/releases/tag/v1.0.3)，版本号定义在仓库根目录的 [`VERSION`](VERSION)。PC包内含单个 `nxc`，NS包仅含模块和启动标记；新版NS模块已通过编译与宿主测试，尚未完成真机验收。
 
 ## 设计要点
 
@@ -65,7 +65,7 @@ docker run --rm -v "$PWD":/work -w /work/device/platform \
   bash -lc '. /opt/devkitpro/devkita64.sh && make -j4'
 ```
 
-产出 `nxc.nsp`（ExeFS PFS0 格式）。`device/platform/dist/` 保留更新前主分支的设备成品，**不是当前源码的构建**；本次不发布尚未真机验收的新设备候选。该成品为旧版14工具54方法，长度229103字节，SHA-256 为 `fc5645d6ba53d8f4240d40a1f6e7aff034bb57b1b01af500dcaff2487f4e4a8d`；新设备源码须完成目标固件验收后再替换发行成品。
+产出 `nxc.nsp`（ExeFS PFS0 格式）。`device/platform/dist/` 保留更新前主分支的设备成品，**不是当前源码的构建**；最新版安装包从上方Release下载，验收范围以发布说明为准。该成品为旧版14工具54方法，长度229103字节，SHA-256 为 `fc5645d6ba53d8f4240d40a1f6e7aff034bb57b1b01af500dcaff2487f4e4a8d`；新设备源码须完成目标固件验收后再替换发行成品。
 `nxc-recovery` 是独立的小程序，在 `tools/nxc-recovery/` 里用同样的命令构建。
 
 ## 装到卡上
