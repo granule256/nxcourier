@@ -111,40 +111,21 @@ void notificationThread(void*) {
 
         ++g_events;
         g_lastState = static_cast<int>(state);
-        log::ring("power: 收到 state=%d(%s) flags=0x%X mode=%s",
-                  static_cast<int>(state), stateName(state),
-                  static_cast<unsigned>(flags), modeName(g_mode));
+        log::ring("power: 收到 state=%d(%s) flags=0x%X",
+                  static_cast<int>(state), stateName(state), static_cast<unsigned>(flags));
 
         if (isSleepState(state)) {
             ++g_sleepEvents;
-            if (g_mode == Mode::Close) {
-                g_sleeping = true;
-                // ★★★ 2026-10-06 晚：**只有"本周期还没关过"才去等主线程。**
-                //
-                //   一个睡眠周期会连着来好几个状态（`ReadySleep` → `ReadySleepCritical` → …），
-                //   而原来每次都把 `g_socketsClosed` 清掉再等 900ms ⇒ **第二个状态必然白等满**：
-                //   那时主线程早已关完、正卡在"等醒来"的循环里，**不会再有人回报**
-                //   （`reportSocketsClosed()` 只在主循环的睡眠分支里调一次）。
-                //   ⇒ 实测无害（PSC 的派发超时是秒级），但这 900ms 是**我们在给 PSC 的等待加时间**，
-                //     纯风险、零收益。
-                //   ★ 标志的清除放在**醒来**分支 —— 那样下一个睡眠周期照原样再等一遍。
-                if (g_socketsClosed) {
-                    log::ring("power: state=%d(%s) —— 本周期 socket 已收干净，立刻应答",
-                              static_cast<int>(state), stateName(state));
-                } else {
-                    const bool closed = waitSocketsClosed(900);
-                    if (!closed) {
-                        log::ring("power: 等 socket 关闭超时(900ms)，仍然应答"
-                                  "（绝不能让 PSC 等我们等到超时）");
-                    }
-                }
+            g_sleeping = true;
+            // 一个睡眠周期只等一次关连接确认，后续状态不重复等待。
+            if (!g_socketsClosed && !waitSocketsClosed(900)) {
+                log::ring("power: 等 socket 关闭超时(900ms)，仍然应答");
             }
         } else if (isWakeState(state)) {
-            if (g_mode == Mode::Close) {
-                g_sleeping      = false;
-                g_socketsClosed = false;   // ★ 下一个睡眠周期重新走一遍"等主线程关 socket"
-                g_woke          = true;
-            }
+            g_sleeping      = false;
+            g_socketsClosed = false;
+            g_acked         = false;
+            g_woke          = true;
         }
 
         const Result rcAck = pscPmModuleAcknowledge(&g_module, state);
@@ -159,52 +140,7 @@ void notificationThread(void*) {
 
 }  // namespace
 
-const char* modeName(Mode m) {
-    switch (m) {
-        case Mode::Off:     return "off";
-        case Mode::Observe: return "observe";
-        case Mode::Close:   return "close";
-    }
-    return "?";
-}
-
-bool parseMode(const char* text, Mode* out) {
-    if (text == nullptr || out == nullptr) return false;
-    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') ++text;
-
-    struct Entry { const char* name; Mode m; };
-    static const Entry kEntries[] = {
-        {"off",     Mode::Off},
-        {"observe", Mode::Observe},
-        {"close",   Mode::Close},
-    };
-    for (const Entry& e : kEntries) {
-        const int n = static_cast<int>(__builtin_strlen(e.name));
-        // 逐字符比较（不引 <cstring>，这个文件保持极薄）
-        int i = 0;
-        for (; i < n; ++i) {
-            if (text[i] == '\0') break;
-            char c = text[i];
-            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-            if (c != e.name[i]) break;
-        }
-        if (i != n) continue;
-        const char c = text[n];
-        if (c == '\0' || c == '\r' || c == '\n' || c == ' ' || c == '\t') {
-            *out = e.m;
-            return true;
-        }
-    }
-    return false;
-}
-
-bool start(Mode m) {
-    g_mode = m;
-    if (m == Mode::Off) {
-        log::ring("power: PSC 未启用（psc_mode=off）");
-        return false;
-    }
-
+bool start() {
     if (R_FAILED(pscmInitialize())) {
         log::ring("power: pscmInitialize 失败 —— 没有电源通知（睡眠时不收口）");
         return false;
@@ -244,8 +180,8 @@ bool start(Mode m) {
         return false;
     }
 
-    log::ring("power: PSC 已注册（id=%d deps={Fs} autoclear=1 mode=%s）",
-              static_cast<int>(kModuleId), modeName(m));
+    log::ring("power: PSC 已注册（id=%d deps={Fs} autoclear=1）",
+              static_cast<int>(kModuleId));
     return true;
 }
 

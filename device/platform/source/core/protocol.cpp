@@ -8,7 +8,7 @@
 
 #include "platform.hpp"
 #include "sd.hpp"     // ★ 需要 nxc::sd::kEnabled（实验期工具拦截）
-#include "net.hpp"    // ★ 需要 nxc::net::kListenEnabled（同理）
+#include "net.hpp"
 #include "jobs.hpp"
 #include "power.hpp"  // ★ 需要 nxc::power::*（睡眠时收口，见 core/power.hpp）
 
@@ -407,22 +407,7 @@ void dispatch(const char* method, const Args& args, Reply& reply) {
         return;
     }
 
-    // ★★★ 2026-10-06：**被实验摘掉的能力，对应工具必须在唯一入口一起挡掉。**
-    //
-    //   为什么必须在**唯一入口**挡，而不是逐个补安全包装：
-    //     · `fs.ls`  用的是**裸 `opendir` / `readdir` / `::stat`**；
-    //       `fs.mkdir` / `fs.rm` 用**裸 `::mkdir` / `::remove`**；
-    //     · `save.*` 直接调 **`fsOpenSaveDataInfoReader` / `fsOpenSaveDataFileSystem`**
-    //       —— 那需要 `fs` 服务会话；
-    //     · `net.info` / `net.probe` / `net.deps` 直接调 **`::socket()` / `::connect()`**
-    //       —— 那需要 `socketInitialize` 建好的 bsd 子系统。
-    //   ★ 这些在**能力被摘掉时不是"返回错误"，而是【崩溃】**
-    //     （2026-10-05 就是这个形态把主机搞到进不去系统，要靠拔卡救）。
-    //   ⇒ 逐个补包装 = 漏一个就是地雷；在唯一入口一刀切 ⇒ 任何漏网调用点都够不着。
-    if (!nxc::net::networkUp() && std::strcmp(tool->name, "net") == 0) {
-        reply.fail(503, "tool-disabled-net-off");
-        return;
-    }
+    // 禁用SD时，统一拒绝需要挂载和fs会话的工具，避免底层裸调用崩溃。
     if (!nxc::sd::kEnabled &&
         (std::strcmp(tool->name, "fs") == 0 || std::strcmp(tool->name, "save") == 0)) {
         reply.fail(503, "tool-disabled-sd-off");
@@ -614,7 +599,7 @@ bool submitLine(int slot, char* line, bool tooLong) {
     return true;
 }
 
-// 当前还开着的客户端数（`acceptonly` 用它判断"能不能把监听口开回来"）。
+// 当前还开着的客户端数，用于运行状态日志。
 int activeClientCount() {
     int n = 0;
     for (int i = 0; i < kMaxClients; ++i) {
@@ -623,19 +608,13 @@ int activeClientCount() {
     return n;
 }
 
-// ★ 备注（2026-10-06）：这里曾经有一层 `transportPoll()` 转发 —— 为了在"照抄 SysDVR 自带
-//   socket 内存池"的模式下改用 `bsdPoll`（因为那个模式绕开 `socketInitialize`，
-//   libnx 的 `::poll` 会因没有 "soc" devoptab 而失败）。
-//   ★ 那条路已放弃（libnx **不导出** `bsdInitialize`/`bsdExit`）⇒ 这层转发也撤掉了，
-//     一律用 libnx 的 `::poll`。
-
 }  // namespace
 
 // ---------------------------------------------------------------- 监听口
 // ★ 注意：**必须定义在 `nxc::protocol` 这一层**（不能在匿名命名空间里另起一份）——
 //   否则和 `platform.hpp` 里那份声明撞名，调用点会报 ambiguous（编译期就炸了，这是好事）。
 // 建监听口：socket + SO_REUSEADDR + bind(47800) + listen。成功返回 fd，失败返回 -1。
-// ★ 抽出来是为了让 `acceptonly` 模式能在"客户端全断开"时**把监听口开回来**。
+// 唤醒或监听异常后复用同一个入口恢复。
 int openListener() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -655,8 +634,6 @@ int openListener() {
         return -1;
     }
 
-    // ★ 照抄验证（`likedmnt2` 模式）：Atmosphère 的 dmnt.gen2 **不设** `SO_REUSEADDR`。
-    //   其余模式保持原样（我们一直设着）。
     if (nxc::net::useReuseAddr()) {
         int yes = 1;
         ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
@@ -673,36 +650,27 @@ int openListener() {
         ::close(fd);
         return -1;
     }
-    // backlog：`likedmnt2` 模式照抄 dmnt.gen2 的 1，其余给足 8（多客户端：
-    // MCP 长连接 + 命令行要能同时挤进来）。
+    // 保持多客户端监听。
     const int backlog = nxc::net::listenerBacklog();
     if (::listen(fd, backlog) != 0) {
         log::ring("net: listen failed");
         ::close(fd);
         return -1;
     }
-    log::ring("net: listener fd=%d mode=%s svc=%s backlog=%d reuseaddr=%d",
-              fd, nxc::net::modeName(nxc::net::mode()),
-              nxc::net::systemSocketService() ? "bsd:s" : "bsd:u",
-              backlog, nxc::net::useReuseAddr() ? 1 : 0);
+    log::ring("net: listener fd=%d svc=bsd:u backlog=%d reuseaddr=%d",
+              fd, backlog, nxc::net::useReuseAddr() ? 1 : 0);
     return fd;
 }
 
-void serveForever(int listenFd, bool keepListenerOpen) {
+void serveForever(int listenFd) {
     pollfd fds[kMaxClients + 1];
     int slots[kMaxClients + 1];
     if (!startWorker()) { if (listenFd >= 0) ::close(listenFd); return; }
     int listener = listenFd;          // -1 ⇒ 现在没有监听口
-    log::ring("net: serveForever listen=%d keepOpen=%d", listener, keepListenerOpen ? 1 : 0);
+    log::ring("net: serveForever listen=%d", listener);
 
     for (;;) {
-        // ★★★ 2026-10-06 方案 A（照抄 sys-con 的 PSC 做法）：系统要睡了 ⇒ **把全部 socket 关掉**。
-        //   为什么非要这样：一整天的对照实验把规律钉死了 ——
-        //     `bdsonly`（没有任何 socket）**不崩**；`listen`（监听口）**崩**；
-        //     `acceptonly`（监听口已关、**只留一条已建立的连接**）**也崩**
-        //     ⇒ ★ **睡眠那一刻只要有【任何】打开的 socket 就崩**（`0x2A5` = SPSM「派发超时」）。
-        //   ★ 纪律 1：**关干净之后才让通知线程去应答**（应答早了 = 等于没关）。
-        //   ★ 纪律 2：**fd 只在这一处（主线程）关**，通知线程只碰标志位（见 `core/power.hpp`）。
+        // 睡眠前关闭全部socket后再确认PSC；fd仅由网络线程操作。
         if (nxc::power::sleepRequested()) {
             g_work.cancelAll();
             if (listener >= 0) { ::close(listener); listener = -1; }
@@ -720,19 +688,13 @@ void serveForever(int listenFd, bool keepListenerOpen) {
             // ★ 醒来重开监听口。开不上不致命 —— 下一轮循环会用同一条重开逻辑再试。
             listener = openListener();
             log::ring("power: 醒来，listener fd=%d", listener);
-            log::ring("PSC 醒来 state=%d → 重开监听口 fd=%d（mode=%s）",
-                       nxc::power::lastState(), listener, nxc::net::modeName(nxc::net::mode()));
+            log::ring("PSC 醒来 state=%d → 重开监听口 fd=%d",
+                       nxc::power::lastState(), listener);
             continue;
         }
 
-        // ★★★ 监听口不在就开回来 —— 两种情况都走这里：
-        //   · `acceptonly` 模式：连上第一个客户端时把监听口收掉了（客户端全断就该开回来）；
-        //   · **PSC 收口**：睡眠时关掉了，醒来重开（`openListener` 在 `continue` 之前已经试过一次，
-        //     这里是不成功时的重试，也是 `keepListenerOpen=true` 各模式唯一的重开路径）。
-        //   ★ 原来这个条件里带了 `!keepListenerOpen` ⇒ **`listen` 模式下醒来若第一次重开失败，
-        //     就再也不会重开**（端口永久消失、看起来像"模块挂了"）。现在去掉那个限制。
-        // listen 模式在已有客户端在线时也要恢复监听；acceptonly 才等全部断开。
-        if (listener < 0 && (keepListenerOpen || activeClientCount() == 0)) {
+        // 包括唤醒和异常恢复，已有客户端在线时也继续恢复监听。
+        if (listener < 0) {
             listener = openListener();
             log::ring("net: listener reopened fd=%d", listener);
         }
@@ -770,8 +732,8 @@ void serveForever(int listenFd, bool keepListenerOpen) {
         if (ready == 0) {
             static int s_servingTick = 0;
             if (++s_servingTick % 300 == 0) {   // ~30 秒一条
-                log::ring("serving tick=%d (mode=%s, clients=%d, listener=%d, psc_events=%d, psc_sleep=%d)",
-                           s_servingTick / 300, nxc::net::modeName(nxc::net::mode()),
+                log::ring("serving tick=%d (clients=%d, listener=%d, psc_events=%d, psc_sleep=%d)",
+                           s_servingTick / 300,
                            activeClientCount(), listener >= 0 ? 1 : 0,
                            nxc::power::eventCount(), nxc::power::sleepEventCount());
             }
@@ -835,15 +797,6 @@ void serveForever(int listenFd, bool keepListenerOpen) {
 
                 log::ring("client connected slot=%d", slot);
 
-                // ★★★ `acceptonly` 模式：**连上第一个客户端就把监听口收掉**。
-                //   要验证的假设是"元凶是处于 `listen` 状态的那个口，而已建立的连接是无辜的"
-                //   ⇒ 若这一版不崩，修法就成立（MCP 的长连接天然就是这个形态：
-                //     它连上之后就一直握着，很少需要重连）。
-                if (!keepListenerOpen) {
-                    ::close(listener);
-                    listener = -1;
-                    log::ring("net: listener closed (acceptonly) — 只留已建立连接");
-                }
                 continue;
             }
 

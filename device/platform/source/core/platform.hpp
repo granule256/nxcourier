@@ -98,13 +98,8 @@ int openListener();
 // 监听 + 多客户端轮询（poll，永不返回）。
 // 支持同时服务多个连接 —— MCP 网关持长连接时，命令行仍然进得来。
 //
-// ★★ `keepListenerOpen`：
-//   · `true`  —— 长期保留监听口（= 老的 `listen` 模式，**实测会让主机睡眠崩**）
-//   · `false` —— **连上第一个客户端就把监听口关掉**，只留已建立的连接；
-//                客户端全断开时再把监听口开回来。
-//     这是 `acceptonly` 模式的实现（见 `source/core/net.hpp` 的实测依据）：
-//     要验证"元凶是处于 `listen` 状态的口，而已建立的连接是无辜的"。
-void serveForever(int listenFd, bool keepListenerOpen);
+// 睡眠期间关闭所有socket，唤醒后恢复监听。
+void serveForever(int listenFd);
 
 }  // namespace protocol
 

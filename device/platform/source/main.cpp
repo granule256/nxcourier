@@ -86,11 +86,6 @@ enum InitBit : u32 {
 
 u32 g_init = 0;
 
-// ★★★ 曾经试过、**已放弃**：静态 socket 内存池（照抄 dmnt.gen2 的 `g_socket_memory` /
-//   SysDVR 的 `TmemBackingBuffer`）—— 那块 2.25MB 的静态数组已经删掉了。
-//   放弃原因：libnx **不导出** `bsdInitialize`/`bsdExit`（链接期 `nm` 实测）⇒ 走不通；
-//   而且 `sys-botbase` 用 libnx 原路（内核分配）也不崩 ⇒ 内存池来源不是关键。详见下面的注释。
-
 // ★★★ 这是**降级用**的小配置（不是首选）—— 2026-10-06 实验 H-A 改。
 //
 //   原来的历史：这一组曾是**唯一**的配置，注释写着"已知可用，别随手放大"，
@@ -118,28 +113,6 @@ SocketInitConfig makeSmallSocketConfig() {
     return cfg;
 }
 
-// ★★★ 2026-10-06 新增（`likedmnt2` 模式）：**照抄 Atmosphère 自己的 standalone GDB 桩
-//   （`dmnt.gen2` TCP 模式）的 socket 配置**。动机：那个桩在 `0.0.0.0:22225`
-//   **长期 listen、零睡眠处理**（`dmnt2_main.cpp` 全文件无 pscm、主线程 `SleepThread(1天)`），
-//   却在我们机器上**跨整个崩溃循环一直不崩** ⇒ 我们和它的差异才是真凶。
-//   已知差异（逐行核过 `stratosphere/dmnt.gen2/` 与 `libraries/libstratosphere/`）：
-//     ① socket 配置 = `socket::SystemConfigLightDefault` ⇒ `m_system = true`
-//        ⇒ `service_type = (1<<1)` ⇒ **`bsd:s`**（我们是 libnx 默认的 `bsd:u`）
-//     ② `Listen(fd, 0)` ⇒ **backlog = 0**（我们原来 8）
-//     ③ **不设 `SO_REUSEADDR`**（我们原来设了）
-//     ④ `sb_efficiency = 2`、并发会话 = 2（libnx 默认是 4 / 3）
-//   ★★★ **一个必须知道的坑**（libnx `bsd.c` 的 `_bsdInitialize` 源码）：
-//     回退到 `bsd:u` **只在 `service_type` 里带了 `BsdServiceType_User` 时才发生**。
-//     这里**故意只传 `BsdServiceType_System`** ⇒ 若拿不到 `bsd:s` 权限，`socketInitialize`
-//     会**直接失败**（不会静默退到 bsd:u）。这正是我们要的：**失败可见**，
-//     好过"以为在用 bsd:s、其实在用 bsd:u"（H-A 就栽在"实验静默空跑"上）。
-SocketInitConfig makeSystemServiceConfig() {
-    SocketInitConfig cfg = *socketGetDefaultInitConfig();   // 不手抄默认值，避免抄错
-    cfg.bsd_service_type = BsdServiceType_System;           // bsd:s（只传 System ⇒ 失败可见）
-    cfg.sb_efficiency    = static_cast<u32>(nxc::net::sbEfficiency());
-    cfg.num_bsd_sessions = static_cast<u32>(nxc::net::bsdSessionCount());
-    return cfg;
-}
 
 }  // namespace
 
@@ -271,128 +244,8 @@ int main(int /*argc*/, char** /*argv*/) {
     nxc::log::breadcrumb("main: enter, tools=%d, mask=0x%X",
                          nxc::reg::toolCount(), g_init);
 
-    // ---------------------------------------------------------------- 网络模式
-    // ★★★ 2026-10-06：**网络层已实测是崩因**（完全不建网时模块活了 192 秒、崩溃报告没增加），
-    //   现在要把它**切开看内部**。模式从 SD 上 `/config/nxc/net_mode.txt` 读
-    //   （改一行字 + 重启即可，不用重编）：
-    //     `off`      完全不建网（已知**不崩**，保底模式）
-    //     `bdsonly`  只 `socketInitialize`（建 `bsd` 会话 + transfer memory），
-    //                **不 listen、不建任何 socket** —— 与 `off` 的唯一差别就是"持有一个 bsd 客户端"
-    //     `listen`   完整（已知**会崩**）
-    //   ★ 读不到 / 值不认识 ⇒ 用 `kDefaultMode`（= `off`）—— **安全优先**：
-    //     免得模式文件写坏就把主机拖进崩溃循环。
-    nxc::net::Mode netMode = nxc::net::kDefaultMode;
-    {
-        FILE* f = nxc::sd::open("/config/nxc/net_mode.txt", "rb");
-        if (f != nullptr) {
-            char buf[64];
-            const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
-            std::fclose(f);
-            buf[n] = '\0';
-            nxc::net::Mode parsed{};
-            int delay = 0;
-            if (nxc::net::parseMode(buf, &parsed, &delay)) {
-                netMode = parsed;
-                nxc::net::g_listenDelaySec = delay;
-            } else {
-                nxc::log::ring("net_mode.txt 的内容不认识，保留缺省 %s",
-                               nxc::net::modeName(netMode));
-            }
-        } else {
-            nxc::log::ring("net_mode.txt 读不到，用缺省 %s", nxc::net::modeName(netMode));
-        }
-    }
-    nxc::net::setMode(netMode);
-    nxc::log::breadcrumb("main: net mode=%s", nxc::net::modeName(netMode));
-    nxc::log::watch("net mode=%s (start)", nxc::net::modeName(netMode));
-
-    // ---------------------------------------------------------------- PSC 模式
-    // ★★★ 2026-10-06：PSC 收口**重新启用**（上一次因"卡开机"被停用，原因已查明并修好）。
-    //   真凶不是"注册太早"，而是**我们把假应答灌进了 PSC 状态机**：
-    //   libnx 的 `pscPmModuleGetRequest()` **自己不阻塞**，上一版 100ms 轮询它、
-    //   拿到 `state=0` 就盲目 `Acknowledge`。现在照抄 sys-con 用 `waitSingle` 先等事件。
-    //   ★ 独立佐证：**`MissionControl` 也是 boot2 模块、也在开机期注册 `pscm`**
-    //     ⇒ "boot2 + 开机期注册 PSC"本身是安全的。
-    //   ★ 同样从 SD 读（改一行字 + 重启即切换，不用重编）：
-    //        `off`     不注册（缺省，安全优先）
-    //        `observe` 注册 + 记录状态 + 立刻 Ack，**但不动 socket**（隔离实验）
-    //        `close`   注册 + 睡眠时关掉全部 socket、醒来重开（真正的修法）
-    nxc::power::Mode pscMode = nxc::power::Mode::Off;
-    {
-        FILE* f = nxc::sd::open("/config/nxc/psc_mode.txt", "rb");
-        if (f != nullptr) {
-            char buf[64];
-            const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
-            std::fclose(f);
-            buf[n] = '\0';
-            nxc::power::Mode parsed{};
-            if (nxc::power::parseMode(buf, &parsed)) {
-                pscMode = parsed;
-            } else {
-                nxc::log::ring("psc_mode.txt 的内容不认识，保留缺省 %s",
-                               nxc::power::modeName(pscMode));
-            }
-        } else {
-            nxc::log::ring("psc_mode.txt 读不到，用缺省 %s", nxc::power::modeName(pscMode));
-        }
-    }
-    nxc::log::watch("psc mode=%s (start)", nxc::power::modeName(pscMode));
-
-    // ★★★ 判据必须是"这个模式要不要建监听口"，**绝不能**写成 `!= Mode::Listen`！
-    //   踩坑（2026-10-06，本文件第三次因为"分支条件没跟着改"而白烧一轮）：
-    //   我后来加了 `AcceptOnly` / `LikeDmnt2` 两个模式，但这个条件没同步改
-    //   ⇒ 它们**掉进了"断网空转"分支** ⇒ 根本没建监听口 ⇒ 47800 直接拒绝，
-    //     而现象看起来像"不崩了"（**假阳性**）。
-    //   ★ 抓出真相的是黑匣子：`watch_boot68.txt` 里写着 `step=idle tick=3 (mode=likedmnt2)`。
-    //   ⇒ 现在统一用 `nxc::net::listenEnabled()`（它已把 Listen / AcceptOnly / LikeDmnt2 都算上）
-    //     ⇒ 以后**加模式只需要改 `net.hpp` 那一处**，这里不会再漏。
-    if (!nxc::net::listenEnabled()) {
-        // ★ 这两支都**不 listen** ⇒ 没有 47800 ⇒ 读数只能靠 SD 上的 watch 文件
-        //   （每 30 秒一条，含系统 tick 与 RTC 墙钟）+ 用户的 ftpd 拉崩溃报告。
-        // ★★ 先明确宣告"这一支不会建监听口" —— 免得再被误读成"不崩了"。
-        nxc::log::watch("NET OFF: no listener will be created (mode=%s) — 47800 不会出现",
-                        nxc::net::modeName(nxc::net::mode()));
-        if (netMode == nxc::net::Mode::BsdOnly) {
-            // 只把 `bsd` 会话 + transfer memory 建起来，**不建 socket、不 listen**。
-            // ⇒ 这一支与 `off` 的唯一差别是"持有一个 bsd 客户端"，
-            //   正好回答"元凶是 `bsd` 会话还是监听口"。
-            if (nxc::host::smOpen()) {
-                const Result rc = socketInitialize(nullptr);   // 默认配置（= 参照模块那套）
-                nxc::log::watch("bdsonly: socketInitialize rc=0x%08X bsd=0x%08X",
-                                static_cast<unsigned>(rc),
-                                static_cast<unsigned>(socketGetLastResult()));
-                if (R_SUCCEEDED(rc)) g_init |= kInitSocket;
-                nxc::host::smClose();   // 用完就把 sm 还掉（睡眠时不持有它）
-            } else {
-                nxc::log::watch("bdsonly: sm unavailable for socketInitialize");
-            }
-        }
-
-        for (int tick = 0; ; ++tick) {
-            svcSleepThread(30000000000ULL);   // 30s
-            // ★ 黑匣子：每 30 秒一条，含**系统 tick 与 RTC 墙钟**。
-            //   睡眠时系统 tick 会停、而 RTC 继续走 ⇒ 两者撕开后的**差值一跳
-            //   就是"确实睡过"的铁证**；文件名带开机号 ⇒ 崩过之后再开机也不会
-            //   把崩前那一条冲掉。
-            nxc::log::watch("idle tick=%d (mode=%s)", tick, nxc::net::modeName(nxc::net::mode()));
-        }
-    }
-
-    // ★★ 可选的"**socket 初始化延迟**"（模式文件里第二个数字，如 `likedmnt2 20`）。
-    //   ★★ 为什么把它从"建监听口之前"挪到"**socket 初始化之前**"：
-    //     上一轮我延迟的是**建监听口**，实测无效（而且被用户点破：那次睡在口建出来之前，
-    //     等于没口，测了个寂寞）。而 `sys-botbase` 里那行**没有注释、当年被放弃不抄**的
-    //     `svcSleepThread(20 秒)` 延迟的是**整个 socket 初始化** —— **两件事不一样**。
-    //   ★ 而且这次有**代码级理由**：Atmosphère 自己的注释写的是
-    //     「**socket 驱动**需要 WiFi，而 WiFi 要等系统完全起来」——
-    //     ★ 它说的是 **socket 初始化**，不是"监听"。我们现在是开机 **11.5 秒**就把 bsd
-    //     客户端注册进去了（`socketInitialize` 第 1 次尝试就成功），而系统"完全起来"
-    //     （端口可连）约在 35 秒 ⇒ 很可能就是**注册得太早**留下的坏状态。
-    if (nxc::net::listenDelaySec() > 0) {
-        nxc::log::watch("socket-init delay: 等 %d 秒再 socketInitialize（mode=%s）",
-                        nxc::net::listenDelaySec(), nxc::net::modeName(nxc::net::mode()));
-        svcSleepThread(static_cast<u64>(nxc::net::listenDelaySec()) * 1000000000ULL);
-    }
+    // 正常监听和睡眠收口是固定行为，不再读取实验模式文件。
+    nxc::log::watch("network: listen with PSC socket cleanup");
 
     // ★ socket 的初始化需要 sm（要经 sm: 拿 bsd 端口）—— 所以这里临时开一下。
     //   开完立刻关：**睡眠时我们不持有 sm**（这就是本次改动的目标）。
@@ -417,28 +270,11 @@ int main(int /*argc*/, char** /*argv*/) {
     //   ★ 安全性：`socketInitialize(NULL)` 失败**不会** abort、也不会卡住 —— 它只是返回错误，
     //     我们照旧往下走 ⇒ 最坏情况是"退回小配置"，与改之前一模一样。
     SocketInitConfig smallCfg = makeSmallSocketConfig();
-    SocketInitConfig sysCfg   = makeSystemServiceConfig();   // ★ likedmnt2 模式用（bsd:s）
-    const bool useSysService  = nxc::net::systemSocketService();
     bool usingFallback = false;
     for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
-        // ★★★ `likesysdvr`（照抄 SysDVR）：**绕开 `socketInitialize`，直接 `bsdInitialize`**，
-        //   并把 socket 内存池指向我们自己的静态数组。
-        //   为什么要绕：libnx 的 `SocketInitConfig` **没有**内存池字段，`tmem_buffer` 只在
-        //   `BsdInitConfig`（`bsd.h`）里 ⇒ 想自己给内存池就只能直接调 `bsdInitialize`。
-        //   其余模式照旧（`likedmnt2` 用 `bsd:s`、其它用 libnx 默认配置）。
-        // ★★★ 「自带 socket 内存池」这条路：**原本被我误判为"已放弃"，2026-10-06 已纠正。**
-        //   ★ 当时写的"放弃原因"是「`bsdInitialize`/`bsdExit` 在 libnx 里是内部符号、没有导出」。
-        //   ★★ 实测推翻（`nm` `devkitpro/devkita64` 里的 `libnx.a`）：
-        //      `T bsdExit` / `T bsdInitialize` —— **两个都是导出的**，可以直接调用。
-        //   ⇒ 路线是通的，但**代价明确**：直接调 `bsdInitialize` 不会注册 libnx 的 `"soc"`
-        //     devoptab ⇒ `::poll`/`::send`/`::recv`/`::accept` 全失效，约 30 个调用点要换成
-        //     `bsdPoll`/`bsdSend`/...（= 照抄 libstratosphere 的 `socket_api.os.horizon.cpp`）。
-        //   ⇒ 详见 `core/net.hpp` 里 `likesysdvr` 那条注释；**留作 PSC 之后的下一个候选。**
-        const Result rcDefault = useSysService ? socketInitialize(&sysCfg)
-                                               : socketInitialize(nullptr);
+        const Result rcDefault = socketInitialize(nullptr);
         if (R_SUCCEEDED(rcDefault)) {
-            nxc::log::ring("socket: DEFAULT config OK (attempt %d, svc=%s)", attempt,
-                           useSysService ? "bsd:s" : "bsd:u");
+            nxc::log::ring("socket: DEFAULT config OK (attempt %d, svc=bsd:u)", attempt);
             g_init |= kInitSocket;
             break;
         }
@@ -450,16 +286,9 @@ int main(int /*argc*/, char** /*argv*/) {
         nxc::log::ring("socket: DEFAULT FAILED attempt=%d rc=0x%08X bsd=0x%08X",
                        attempt, static_cast<unsigned>(rcDefault),
                        static_cast<unsigned>(socketGetLastResult()));
-        // ★★ 同一件事**再写一份到"黑匣子"**（per-boot 文件，不会被下次开机冲掉）。
-        //   为什么必须双写：`likedmnt2` 模式的默认配置**故意只传 `BsdServiceType_System`**
-        //   —— 拿不到 `bsd:s` 时会直接失败、然后当轮降级到小配置（bsd:u）**照常工作**。
-        //   若只写环形日志，一旦以后崩机重启就再也看不到"这次其实没用上 bsd:s"，
-        //   就会把"没崩"错读成"bsd:s 有效"（H-A 正是栽在这种静默空跑上）。
-        nxc::log::watch("socket DEFAULT FAILED attempt=%d rc=0x%08X bsd=0x%08X mode=%s svc=%s",
+        nxc::log::watch("socket DEFAULT FAILED attempt=%d rc=0x%08X bsd=0x%08X svc=bsd:u",
                         attempt, static_cast<unsigned>(rcDefault),
-                        static_cast<unsigned>(socketGetLastResult()),
-                        nxc::net::modeName(nxc::net::mode()),
-                        useSysService ? "bsd:s" : "bsd:u");
+                        static_cast<unsigned>(socketGetLastResult()));
 
         const Result rcSmall = socketInitialize(&smallCfg);
         if (R_SUCCEEDED(rcSmall)) {
@@ -480,24 +309,6 @@ int main(int /*argc*/, char** /*argv*/) {
         svcSleepThread(1000000000ULL);  // 1s
     }
 
-    // ★★★★ 2026-10-06 15:17 曾在此处**停用** PSC 电源通知（方案 A），因为它导致
-    //   **开机卡在 logo**（第 3 类事故）。★ 16:xx 查明真凶并修好，**现已恢复**，
-    //   但**调用点挪到了监听口建好之后**（见下面 `serveForever` 之前那段）。
-    //
-    //   ★★ 当时的两条归因，现在都不是原因（记下来免得再绕回去）：
-    //     ① "注册得太早（早于系统初始化）" ⇒ **错**。`MissionControl`、`sys-con`
-    //        都是 boot2 模块、都在开机期注册 `pscm`，都不卡开机。
-    //     ② "handler 里做了阻塞动作（等主线程关 socket，最多 3 秒）" ⇒ 只对了一半：
-    //        阻塞的**上限**确实要压小（现在 900ms），但真正卡死的是另一件事 ——
-    //        ★★★ **libnx 的 `pscPmModuleGetRequest()` 自己不阻塞**（只发 IPC 就返回），
-    //        而上一版是"100ms 轮询 GetRequest，成功就 Acknowledge"
-    //        ⇒ 没有待处理请求时也会拿到 `state=0`(`Awake`) 并**盲目应答**
-    //        ⇒ **往 PSC 状态机里灌假应答** ⇒ 开机的电源状态确认永远走不完 ⇒ 卡 logo。
-    //        ⇒ 修法：照抄 `sys-con` —— `waiterForEvent()` + `waitSingle()` **先等事件**，
-    //          再 `GetRequest`、再干活、再 `Acknowledge`（见 `core/power.cpp`）。
-    nxc::log::ring("main: PSC 收口将在创建监听口之前注册（psc_mode=%s）",
-                   nxc::power::modeName(pscMode));
-
     // ★ 无论 socket 成不成，先把为它借用的 sm 还掉（下面失败时自己会 return）。
     //   放在这里而不是上面：socketInitialize 自己可能要重试很久。
     if (nxc::host::smIsOpen()) nxc::host::smClose();
@@ -510,44 +321,24 @@ int main(int /*argc*/, char** /*argv*/) {
     //   到底用的是默认配置还是降级的小配置 —— 不必猜。
     nxc::log::breadcrumb("main: socket ready via %s (sm 已归还)",
                          usingFallback ? "SMALL-fallback" : "DEFAULT");
-    // ★★ 同一个读数**再写进"黑匣子"**（per-boot 文件，崩机重启也不会被冲掉）：
-    //   一次看清"这次到底用了哪个配置、哪个 bsd 服务、backlog 多少" ——
-    //   免得又出现"以为在测 A、其实跑的是 B"。
-    //   ★ `svc` 必须写**实际生效的那个**：一旦降级到小配置，那实际就是 `bsd:u`
-    //     （只写 `useSysService` 会谎报成 bsd:s，正是这种谎报让上一轮白烧）。
-    nxc::log::watch("socket ready via %s (mode=%s effective_svc=%s backlog=%d reuseaddr=%d)",
+    nxc::log::watch("socket ready via %s (svc=bsd:u backlog=%d reuseaddr=%d)",
                     usingFallback ? "SMALL-fallback" : "DEFAULT",
-                    nxc::net::modeName(nxc::net::mode()),
-                    usingFallback ? "bsd:u" : (useSysService ? "bsd:s" : "bsd:u"),
-                    nxc::net::listenerBacklog(),
-                    nxc::net::useReuseAddr() ? 1 : 0);
+                    nxc::net::listenerBacklog(), nxc::net::useReuseAddr() ? 1 : 0);
 
-    // 先注册睡眠收口，再创建任何监听socket；初始化失败不能留下无保护监听口。
+    // 维持原有注册等待，先启动PSC通知再创建监听口。
+    constexpr u64 kPscRegisterDelayMs = 30000;
+    svcSleepThread(kPscRegisterDelayMs * 1000000ULL);
     bool pscReady = false;
-    if (pscMode != nxc::power::Mode::Off) {
-        constexpr u64 kPscRegisterDelayMs = 30000;
-        nxc::log::watch("psc: 等 %llu 秒再注册（确保开机已完成，避免「卡开机」这类事故）",
-                        static_cast<unsigned long long>(kPscRegisterDelayMs / 1000));
-        svcSleepThread(static_cast<u64>(kPscRegisterDelayMs) * 1000000ULL);
-
-        if (nxc::host::smOpen()) {
-            const bool ok = nxc::power::start(pscMode);
-            pscReady = ok;
-            nxc::log::watch("psc: 注册%s（mode=%s，id=126 deps={Fs} autoclear=1）",
-                            ok ? "成功" : "**失败**", nxc::power::modeName(pscMode));
-            nxc::host::smClose();   // 用完就还掉
-        } else {
-            nxc::log::watch("psc: sm 借不到，注册不了（mode=%s）",
-                            nxc::power::modeName(pscMode));
-        }
+    if (nxc::host::smOpen()) {
+        pscReady = nxc::power::start();
+        nxc::host::smClose();
     }
-
-    if (!pscReady || pscMode != nxc::power::Mode::Close) {
-        nxc::log::breadcrumb("network disabled: psc_mode=close and successful PSC registration required");
+    if (!pscReady) {
+        nxc::log::breadcrumb("network disabled: PSC registration failed");
         return 0;
     }
     // 首次监听失败也走服务循环重试，不因一次临时网络错误退出模块。
     const int listenFd = nxc::protocol::openListener();
-    nxc::protocol::serveForever(listenFd, nxc::net::keepListenerOpen());
+    nxc::protocol::serveForever(listenFd);
     return 0;
 }

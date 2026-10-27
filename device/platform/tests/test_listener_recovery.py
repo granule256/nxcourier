@@ -71,9 +71,6 @@ namespace net {
 constexpr unsigned short kPort=47800;
 bool useReuseAddr() { return true; }
 int listenerBacklog() { return 8; }
-bool systemSocketService() { return false; }
-int mode() { return 2; }
-const char* modeName(int) { return "listen"; }
 }
 namespace power {
 bool sleepRequested() { return false; }
@@ -117,7 +114,7 @@ void reset() {
     poll_result=1; poll_error=0; slept_ns=0; fail_nonblock=false;
     for(auto& c:nxc::protocol::g_clients) { c.fd=-1; c.len=0; c.dropping=false; }
 }
-void run(bool keep=true) { try { nxc::protocol::serveForever(3,keep); } catch(const Stop&) {} }
+void run() { try { nxc::protocol::serveForever(3); } catch(const Stop&) {} }
 int main() {
     for(short events: {short(POLLERR),short(POLLHUP),short(POLLNVAL),short(POLLERR|POLLIN)}) {
         reset(); test_events=events; run();
@@ -129,8 +126,6 @@ int main() {
     check(listener_closes==0,"listen模式接入正常客户端后保留监听");
     reset(); test_events=POLLERR; nxc::protocol::g_clients[0].fd=9; run();
     check(socket_calls==1 && nxc::protocol::g_clients[0].fd==9,"已有客户端在线时仍须恢复listen监听，不断开现有连接");
-    reset(); test_events=POLLERR; nxc::protocol::g_clients[0].fd=9; run(false);
-    check(socket_calls==0,"acceptonly仍须等待现有客户端全部断开后才重开监听");
     reset(); poll_result=-1; poll_error=ENETDOWN; run();
     check(slept_ns>=100000000ULL,"持续网络poll错误必须退避，不能忙循环");
     reset(); poll_result=-1; poll_error=EINTR; run();
@@ -147,7 +142,7 @@ int main() {
 with tempfile.TemporaryDirectory(prefix='nxc-listener-test-') as temp:
     temp = Path(temp)
     cpp = temp / 'listener.cpp'
-    cpp.write_text(harness + macros + function('int openListener() {') + '\n' + function('void serveForever(int listenFd, bool keepListenerOpen) {') + '\n' + tests)
+    cpp.write_text(harness + macros + function('int openListener() {') + '\n' + function('void serveForever(int listenFd) {') + '\n' + tests)
     binary = temp / 'listener-test'
     subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', str(cpp), '-o', str(binary)], check=True)
     raise SystemExit(subprocess.run([str(binary)]).returncode)

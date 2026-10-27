@@ -46,6 +46,8 @@ class CoreNetwork(unittest.TestCase):
             harness = harness.replace('namespace protocol {', 'namespace reg { int toolCount(){return 14;} }\nnamespace protocol {')
             harness = harness.replace('void flushResponses() {}', 'void flushResponses();')
             harness = harness.replace('namespace log {', 'namespace log { int bootCount(){return 1;}')
+            # 监听口始终存在，EOF应投递给已有客户端而非监听fd。
+            harness = harness.replace('i==0 ? test_events : 0', 'fds[i].fd==7 ? test_events : 0')
             checks = r'''
             }}
             int main() {
@@ -53,7 +55,7 @@ class CoreNetwork(unittest.TestCase):
                 g_clients[0].fd=7; g_clients[0].generation=1;
                 auto* j=g_work.submit(0,1,"input.seq steps=A:10000",false);
                 g_work.take(); test_events=POLLIN;
-                try { serveForever(-1,false); } catch(const Stop&) {}
+                try { serveForever(-1); } catch(const Stop&) {}
                 printf("after_EOF readClosed=%d fd=%d cancelled=%d state=%d\n",
                        g_clients[0].readClosed,g_clients[0].fd,int(j->cancelled.load()),int(j->state.load()));
                 assert(g_clients[0].readClosed && g_clients[0].fd==7 && !j->cancelled.load());

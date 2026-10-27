@@ -74,18 +74,19 @@ docker run --rm -v "$PWD":/work -w /work/device/platform \
 sdmc:/atmosphere/contents/4200000000000012/exefs.nsp         模块本体（nxc.nsp 改名而来）
 sdmc:/atmosphere/contents/4200000000000012/flags/boot2.flag  启动标记
 sdmc:/atmosphere/contents/4200000000000012/toolbox.json      可选，让它出现在 sysmodules 覆盖层里
-sdmc:/config/nxc/net_mode.txt                              内容：listen
-sdmc:/config/nxc/psc_mode.txt                              内容：close
 sdmc:/switch/nxc-recovery.nro                                可选
 ```
 
 `flags/boot2.flag` 不能省。少了它模块不会被加载，表现是「装好了但一点反应也没有」。
 模块的 TID 写在 `device/platform/config.json` 里，改的时候记得同时改卡上的目录名。
 
-还须把 `device/platform/dist/config/nxc/` 复制到 SD 卡的 `/config/nxc/`，
-让 `net_mode.txt` 为 `listen`、`psc_mode.txt` 为 `close`（纯文本，可带结尾换行）。
-源码在缺少网络配置时默认 `off`，只复制模块和启动标记不会开放 `47800`；
-`close` 让模块在系统睡眠时关闭网络连接、唤醒后恢复监听。
+当前源码固定启用正常监听，并在睡眠前关闭连接、唤醒后恢复监听；不再读取 `net_mode.txt` 或 `psc_mode.txt`。
+新构建的最小安装只需要 `exefs.nsp` 和空的 `flags/boot2.flag`；`toolbox.json` 与救援工具可选。
+PSC注册失败时退出，不开放缺少睡眠处理的监听口。旧模式文件即使留在SD卡上也不会影响新模块。
+
+**旧成品兼容：** `device/platform/dist/exefs.nsp` 仍是保留的旧版，使用它时仍须配套复制
+`dist/config/nxc/` 到SD卡 `/config/nxc/`（`listen` / `close`）。这些配置只为旧成品保留；
+移除配置依赖后的新设备构建仍需真机验收，不能只删除旧模块的配置来升级。
 
 ## 用起来
 
@@ -414,7 +415,7 @@ CI运行宿主回归、构建PC运行包并交叉编译设备；不会自动覆�
 | 现象 | 排查方法 |
 | --- | --- |
 | 无心跳、端口不通 | 核对模块目录、`flags/boot2.flag` 和网络配置；查看 `/atmosphere/fatal_errors/` 是否有转储 |
-| 有心跳、端口不通 | 查看 `/config/nxc/boot_progress.txt` 最后一行；确认设备醒着且 `net_mode=listen`、`psc_mode=close` |
+| 有心跳、端口不通 | 查看 `/config/nxc/boot_progress.txt` 最后一行；确认设备醒着、socket初始化和PSC注册成功 |
 | 端口通但无应答 | 用 `identify.id` 核对实际服务状态与开机号，不能只凭TCP握手判为启动完成 |
 | 需要恢复模块 | 使用前述 `nxc-recovery`，或离线换回已知可用成品；停用可移走模块启动标记 |
 
@@ -428,6 +429,7 @@ CI运行宿主回归、构建PC运行包并交叉编译设备；不会自动覆�
 - 修复断线重放修改、旧目标请求误发、上传校验与备份恢复、GDB超时及资源占用状态问题。
 - macOS与Linux各235项测试、独立C++及网络回归、设备交叉编译和PC运行包冒烟通过。
 - 宿主测试与构建不代替真机验收；新设备源码、存档恢复及掉电恢复仍需对应设备验证。
+- 移除网络与PSC实验模式，正常监听和睡眠断连固定启用；新模块无需两个模式配置文件。
 
 ## 许可
 
