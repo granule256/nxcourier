@@ -1,0 +1,37 @@
+name: 宿主回归与设备编译
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 运行离线宿主测试
+        env:
+          CXX: c++
+        run: python3 tests/run_checks.py
+      - name: 构建 PC 单入口运行包
+        run: python3 pc/build_app.py --output pc/dist/nxc
+      - name: 检查 PC 运行包版本入口
+        run: python3 pc/dist/nxc --version
+      - name: 上传 PC 运行包
+        uses: actions/upload-artifact@v4
+        with:
+          name: nxc-python-zipapp
+          path: pc/dist/nxc
+          if-no-files-found: error
+      - name: 用固定工具链交叉编译
+        run: >-
+          docker run --rm
+          -v "$PWD:/work" -w /work/device/platform
+          devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282
+          bash -lc '. /opt/devkitpro/devkita64.sh && make BUILD=build-ci -j2'

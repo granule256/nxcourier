@@ -72,7 +72,7 @@ bool isBootLoaderConfig(const char* path) {
 //     写自己的模块目录 = 自我更新；写 `/bootloader` = 影响下次开机落点。
 //     这两类写入会写面包屑，方便事后回溯"是谁改的"。
 bool gate(const nxc::Args&, nxc::Reply& r, const char* path) {
-    if (path == nullptr || path[0] != '/') {
+    if (path == nullptr || path[0] != '/' || std::strchr(path, ':') != nullptr) {
         r.fail(400, "path-must-be-absolute");
         return false;
     }
@@ -110,27 +110,37 @@ void cmdLs(const nxc::Args& a, nxc::Reply& r) {
     DIR* dir = opendir(path);
     if (dir == nullptr) { r.fail(404, "cannot-open-dir"); return; }
 
+    uint64_t offset = 0, count = kMaxListEntries;
+    if ((a.has("offset") && !nxc::util::parseU64(a.get("offset"), &offset)) ||
+        (a.has("count") && (!nxc::util::parseU64(a.get("count"), &count) || count == 0 || count > kMaxListEntries))) {
+        closedir(dir); r.fail(400, "offset/count-invalid: offset>=0 count=1..200"); return;
+    }
+    uint64_t seen = 0;
     int n = 0;
-    bool truncated = false;
-    for (dirent* e = readdir(dir); e != nullptr; e = readdir(dir)) {
+    bool truncated = false, ok = true;
+    for (;;) {
+        if (nxc::host::operationCancelled()) { closedir(dir); r.fail(499, "operation-cancelled"); return; }
+        errno = 0;
+        dirent* e = readdir(dir);
+        if (!e) { if (errno) ok = false; break; }
         if (std::strcmp(e->d_name, ".") == 0 || std::strcmp(e->d_name, "..") == 0) continue;
-        if (n >= kMaxListEntries) { truncated = true; break; }
-
-        char full[512];
-        std::snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+        if (seen++ < offset) continue;
+        if (static_cast<uint64_t>(n) >= count) { truncated = true; break; }
+        char full[1024];
+        const int len = std::snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+        if (len < 0 || static_cast<size_t>(len) >= sizeof(full)) { ok = false; break; }
         struct stat st;
-        const bool ok = (::stat(full, &st) == 0);
-
-        r.next();
-        r.kv("name", e->d_name);
-        r.kv("type", ok ? (S_ISDIR(st.st_mode) ? "dir" : "file") : "?");
-        r.kvi("size", ok ? static_cast<long long>(st.st_size) : 0);
+        const bool found = (::stat(full, &st) == 0);
+        r.next(); r.kv("name", e->d_name);
+        r.kv("type", found ? (S_ISDIR(st.st_mode) ? "dir" : "file") : "?");
+        r.kvi("size", found ? static_cast<long long>(st.st_size) : 0);
         ++n;
     }
-    closedir(dir);
-
-    r.next();
-    r.kvi("count", n);
+    if (closedir(dir) != 0) ok = false;
+    if (!ok) { r.fail(500, "list-read-or-close-failed"); return; }
+    r.next(); r.kvi("count", n);
+    r.kvi("offset", static_cast<long long>(offset));
+    r.kvi("next_offset", truncated ? static_cast<long long>(offset + n) : -1);
     r.kvi("truncated", truncated ? 1 : 0);
 }
 
@@ -142,6 +152,53 @@ void cmdStat(const nxc::Args& a, nxc::Reply& r) {
     r.kv("path", path);
     r.kv("type", S_ISDIR(st.st_mode) ? "dir" : "file");
     r.kvi("size", static_cast<long long>(st.st_size));
+}
+
+void cmdTransferInfo(const nxc::Args&, nxc::Reply& r) {
+    // data参数受4096字节固定值缓冲限制；3060原始字节编码后4080字节。
+    r.kvi("write_chunk", 3060);
+    r.kvi("read_chunk", kReadChunk);
+    r.kvi("max_inflight", 2);
+    r.kvi("sha256", 1);
+}
+
+void cmdSha256(const nxc::Args& a, nxc::Reply& r) {
+    const char* path = a.get("path");
+    if (!gate(a, r, path)) return;
+    struct stat st{};
+    if (::stat(path, &st) != 0) { r.fail(404, "not-found"); return; }
+    if (!S_ISREG(st.st_mode)) { r.fail(400, "not-regular-file"); return; }
+    FILE* f = nxc::sd::open(path, "rb");
+    if (!f) { r.fail(404, "cannot-open-file"); return; }
+    static unsigned char buffer[4096];
+    Sha256Context context;
+    sha256ContextCreate(&context);
+    long long bytes = 0;
+    bool ok = true, cancelled = false;
+    for (;;) {
+        if (nxc::host::operationCancelled()) { cancelled = true; break; }
+        const size_t n = std::fread(buffer, 1, sizeof(buffer), f);
+        if (n) {
+            sha256ContextUpdate(&context, buffer, n);
+            bytes += static_cast<long long>(n);
+        }
+        if (std::ferror(f)) { ok = false; break; }
+        if (n < sizeof(buffer)) break;
+    }
+    if (std::fclose(f) != 0) ok = false;
+    if (cancelled || nxc::host::operationCancelled()) { r.fail(499, "operation-cancelled"); return; }
+    if (!ok) { r.fail(500, "read-or-close-failed"); return; }
+    unsigned char hash[32];
+    char text[65];
+    static const char hex[] = "0123456789abcdef";
+    sha256ContextGetHash(&context, hash);
+    for (int i = 0; i < 32; ++i) {
+        text[2 * i] = hex[hash[i] >> 4];
+        text[2 * i + 1] = hex[hash[i] & 15];
+    }
+    text[64] = 0;
+    r.kvi("bytes", bytes);
+    r.kv("sha256", text);
 }
 
 void cmdRead(const nxc::Args& a, nxc::Reply& r) {
@@ -166,8 +223,9 @@ void cmdRead(const nxc::Args& a, nxc::Reply& r) {
     static char b64[kReadChunk * 4 / 3 + 8];
 
     const int n = static_cast<int>(std::fread(raw, 1, static_cast<size_t>(len), f));
-    std::fclose(f);
-    if (n < 0) { r.fail(500, "read-failed"); return; }
+    const bool readOk = std::ferror(f) == 0;
+    const bool closeOk = std::fclose(f) == 0;
+    if (!readOk || !closeOk) { r.fail(500, "read-or-close-failed"); return; }
 
     nxc::util::b64Encode(raw, n, b64);
     r.kvi("bytes", n);
@@ -194,11 +252,8 @@ void cmdWrite(const nxc::Args& a, nxc::Reply& r) {
         r.fail(400, "bad-or-too-large-base64: data 必须是合法 base64，且解码后不超过 24000 字节");
         return;
     }
-    // ★★ 2026-10-06 晚：**空载荷要被拒**。`data=`（空串）或 `data===` 会解出 0 字节，
-    //   然后建/截断出一个**空文件**并回 `OK bytes=0` —— 又是一次"回 OK 但没做事"。
-    //   `mem.write` 一直有这道守卫，`fs` 侧原来漏了。
-    if (n == 0) {
-        r.fail(400, "empty-data: data 解出来是 0 字节（不接受空载荷；要清空文件请 fs.rm 后重建）");
+    if (n == 0 && (data[0] != '\0' || append || a.getInt("allow_empty", 0) != 1)) {
+        r.fail(400, "empty-data: 仅 data= append=0 allow_empty=1 可创建或清空文件");
         return;
     }
 
@@ -217,11 +272,12 @@ void cmdWrite(const nxc::Args& a, nxc::Reply& r) {
     FILE* f = nxc::sd::open(path, append ? "ab" : "wb");
     if (f == nullptr) { r.fail(500, "cannot-open-for-write"); return; }
     const size_t written = std::fwrite(raw, 1, static_cast<size_t>(n), f);
-    std::fclose(f);
+    const bool flushed = std::fflush(f) == 0;
+    const bool closed = std::fclose(f) == 0;
 
     // ★★★ 2026-10-06 晚：**短写要报错**。原来无条件回 `bytes=<实际写入数>`，
     //   磁盘满/写失败时只回一个小数字，调用方不看就以为写成功了（同类的假成功）。
-    if (written != static_cast<size_t>(n)) {
+    if (written != static_cast<size_t>(n) || !flushed || !closed) {
         r.failf(500, "short-write: 只写进 %lld/%d 字节（磁盘满？）",
                 static_cast<long long>(written), n);
         return;
@@ -266,13 +322,23 @@ void cmdRm(const nxc::Args& a, nxc::Reply& r) {
 }
 
 // 复制文件（白名单内）。★ 主要用途：**自我更新之前先把旧的 exefs.nsp 备份一份**。
-// 没有 rename 原语，所以就是"读出来 → 写过去"，分块做以免撞上缓冲上限。
+// 复制保留源文件；读一段写一段，分块做以免撞上缓冲上限。
 void cmdCopy(const nxc::Args& a, nxc::Reply& r) {
     const char* src = a.get("src");
     const char* dst = a.get("dst");
     if (!gate(a, r, src)) return;
     if (!gate(a, r, dst)) return;
 
+    struct stat source{}, dest{};
+    if (::stat(src, &source) != 0 || !S_ISREG(source.st_mode)) { r.fail(400, "src-must-be-regular-file"); return; }
+    // FAT 的 devoptab 可能不提供 inode（恒为 0），不能把任意两个文件判作同一个。
+    char resolvedSrc[1024], resolvedDst[1024];
+    const bool samePath = std::strcmp(src, dst) == 0 ||
+        (::realpath(src, resolvedSrc) && ::realpath(dst, resolvedDst) && std::strcmp(resolvedSrc, resolvedDst) == 0);
+    if (samePath || (::stat(dst, &dest) == 0 && source.st_ino != 0 && source.st_dev == dest.st_dev && source.st_ino == dest.st_ino)) {
+        r.fail(409, "src-and-dst-are-same-file"); return;
+    }
+    if (nxc::host::operationCancelled()) { r.fail(499, "operation-cancelled"); return; }
     FILE* in = nxc::sd::open(src, "rb");
     if (in == nullptr) { r.fail(404, "cannot-open-src"); return; }
     FILE* out = nxc::sd::open(dst, "wb");
@@ -285,21 +351,122 @@ void cmdCopy(const nxc::Args& a, nxc::Reply& r) {
     bool ok = true;
     size_t n = 0;
     while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (nxc::host::operationCancelled()) { ok = false; r.fail(499, "operation-cancelled: destination-may-be-partial"); break; }
         if (std::fwrite(buf, 1, n, out) != n) { ok = false; break; }
         total += static_cast<long long>(n);
     }
     if (std::ferror(in)) ok = false;
 
-    std::fclose(in);
-    std::fclose(out);
+    if (std::fclose(in) != 0) ok = false;
+    if (std::fflush(out) != 0) ok = false;
+    if (std::fclose(out) != 0) ok = false;
 
     if (!ok) {
+        if (r.hasError()) return;
         r.failf(500, "copy-failed after %lld bytes", total);
         return;
     }
     r.kv("src", src);
     r.kv("dst", dst);
     r.kvi("bytes", total);
+}
+
+// Horizon 的 RenameFile 不覆盖现有文件；替换时先显式保留旧目标，再发布新文件。
+// 两次 rename 之间存在中断/掉电窗口，因此此接口不承诺原子替换。
+bool canonicalParent(const char* path, char* parent, size_t cap) {
+    const char* slash = std::strrchr(path, '/');
+    if (!slash || !slash[1]) return false;
+    const size_t len = slash == path ? 1 : static_cast<size_t>(slash - path);
+    if (len >= cap) return false;
+    char raw[1024];
+    if (len >= sizeof(raw)) return false;
+    std::memcpy(raw, path, len);
+    raw[len] = 0;
+    return ::realpath(raw, parent) != nullptr;
+}
+
+void cmdRename(const nxc::Args& a, nxc::Reply& r) {
+    const char* src = a.get("src");
+    const char* dst = a.get("dst");
+    if (!gate(a, r, src) || !gate(a, r, dst)) return;
+    const char* replaceText = a.get("replace");
+    if (replaceText && std::strcmp(replaceText, "0") && std::strcmp(replaceText, "1")) {
+        r.fail(400, "replace-invalid: 0|1");
+        return;
+    }
+    const bool replace = !replaceText || std::strcmp(replaceText, "1") == 0;
+    struct stat source{}, dest{};
+    if (::lstat(src, &source) != 0 || !S_ISREG(source.st_mode)) {
+        r.fail(400, "src-must-be-regular-file");
+        return;
+    }
+    const bool exists = ::lstat(dst, &dest) == 0;
+    if (!exists && errno != ENOENT) {
+        r.fail(500, "cannot-check-destination");
+        return;
+    }
+    char resolvedSrc[1024], resolvedDst[1024];
+    const bool samePath = std::strcmp(src, dst) == 0 ||
+        (::realpath(src, resolvedSrc) && ::realpath(dst, resolvedDst) && std::strcmp(resolvedSrc, resolvedDst) == 0);
+    if (samePath || (exists && source.st_ino != 0 && source.st_dev == dest.st_dev && source.st_ino == dest.st_ino)) {
+        r.fail(409, "src-and-dst-are-same-file");
+        return;
+    }
+    if (exists && (!S_ISREG(dest.st_mode) || !replace)) {
+        r.fail(409, "dst-exists-or-not-regular-file");
+        return;
+    }
+    if (nxc::host::operationCancelled()) {
+        r.fail(499, "operation-cancelled");
+        return;
+    }
+    const char* rollback = a.get("rollback");
+    if (exists) {
+        if (!rollback || !*rollback) {
+            r.fail(400, "rollback-required: 现有目标替换必须提供同目录不存在的rollback路径");
+            return;
+        }
+        if (!gate(a, r, rollback)) return;
+        char srcParent[1024], dstParent[1024], rollbackParent[1024];
+        if (!canonicalParent(src, srcParent, sizeof(srcParent)) ||
+            !canonicalParent(dst, dstParent, sizeof(dstParent)) ||
+            !canonicalParent(rollback, rollbackParent, sizeof(rollbackParent)) ||
+            std::strcmp(srcParent, dstParent) || std::strcmp(dstParent, rollbackParent)) {
+            r.fail(400, "src/dst/rollback-must-share-parent");
+            return;
+        }
+        struct stat oldRollback{};
+        if (::lstat(rollback, &oldRollback) == 0) {
+            r.fail(409, "rollback-path-must-not-exist-or-alias-src/dst");
+            return;
+        }
+        if (errno != ENOENT) {
+            r.fail(500, "cannot-check-rollback-path");
+            return;
+        }
+        if (::rename(dst, rollback) != 0) {
+            r.failf(500, "preserve-old-target-failed errno=%d: 原目标保留", errno);
+            return;
+        }
+        // 从此处到成功发布/回滚结束不处理中途取消，优先恢复一个可用的目标路径。
+        if (::rename(src, dst) != 0) {
+            const int publishError = errno;
+            if (::rename(rollback, dst) == 0) {
+                r.failf(500, "publish-failed original-restored errno=%d", publishError);
+            } else {
+                nxc::host::breadcrumb("fs.rename rollback-failed dst=%s rollback=%s", dst, rollback);
+                r.fail(500, "commit-and-rollback-failed: 旧目标保留在请求的rollback路径，请按原请求dst/rollback恢复");
+            }
+            return;
+        }
+        r.kv("rollback", rollback);
+    } else if (::rename(src, dst) != 0) {
+        r.failf(500, "rename-failed errno=%d", errno);
+        return;
+    }
+    r.kv("src", src);
+    r.kv("dst", dst);
+    r.kv("result", "renamed");
 }
 
 // ---------------------------------------------------------------- 自描述元数据（2026-10-06 晚）
@@ -317,6 +484,17 @@ const nxc::Param kSrcDst[] = {
     {"src", "str", true, nullptr, "源文件绝对路径"},
     {"dst", "str", true, nullptr, "目标绝对路径（父目录必须已存在）"},
 };
+const nxc::Param kLs[] = {
+    {"path", "str", true, nullptr, "SD目录绝对路径"},
+    {"offset", "int", false, "0", "跳过的条目数；目录变化时应重新枚举"},
+    {"count", "int", false, "200", "每页条数，1..200"},
+};
+const nxc::Param kRename[] = {
+    {"src", "str", true, nullptr, "SD源普通文件绝对路径"},
+    {"dst", "str", true, nullptr, "SD目标文件绝对路径，父目录必须存在"},
+    {"replace", "0|1", false, "1", "1保留旧目标后替换普通文件；0拒绝已存在目标"},
+    {"rollback", "str", false, nullptr, "目标存在时必填；src/dst/rollback同父目录且rollback不存在"},
+};
 const nxc::Param kRead[] = {
     {"path",   "str", true,  nullptr, "文件绝对路径"},
     {"offset", "int", false, "0",     "从第几字节开始读"},
@@ -326,8 +504,23 @@ const nxc::Param kWrite[] = {
     {"path",   "str",    true,  nullptr, "文件绝对路径"},
     {"data",   "base64", true,  nullptr, "内容（base64）。非法 base64 会被拒，不会静默写垃圾"},
     {"append", "0|1",    false, "0",     "1 = 追加到文件尾；0 = 覆盖"},
+    {"allow_empty", "0|1", false, "0", "1允许 data= 且append=0创建/截断空文件"},
 };
 
+const nxc::MethodInfo kInfoTransfer = {
+    nullptr, 0, "read",
+    "声明当前fs传输边界；只有能力清单包含此方法才调用。\n"
+    "示例: fs.transfer_info\n"
+    "返回: write_chunk=3060 read_chunk=24000 max_inflight=2 sha256=1\n"
+    "分块取客户端及设备上限的较小值，最多两条未应答；断线不重放写入。",
+};
+const nxc::MethodInfo kInfoSha256 = {
+    kPath, 1, "read",
+    "以4096字节固定缓冲流式计算SD普通文件SHA256，不将整文件读入内存。\n"
+    "示例: fs.sha256 path=/config/nxc/file.bin\n"
+    "返回: bytes=实际读取字节数 sha256=64位小写十六进制摘要\n"
+    "检查取消、读取和关闭错误；不提供并发修改文件的快照保证。",
+};
 const nxc::MethodInfo kInfoRoots = {
     nullptr, 0, "read",
     "列出这个平台允许访问的根。\n"
@@ -337,12 +530,12 @@ const nxc::MethodInfo kInfoRoots = {
     "返回: roots=<路径列表>",
 };
 const nxc::MethodInfo kInfoLs = {
-    kPath, 1, "read",
+    kLs, 3, "read",
     "列一个目录（不含子目录），每条给 name / type(file|dir) / size。\n"
-    "★ 硬上限 200 条；被截断时回包里有 truncated=1（**不是静默截断**）。\n"
+    "★ 默认200条；offset/count分页。truncated=1时以next_offset继续，结束next_offset=-1。目录变化请重新枚举。\n"
     "★ 名字里带空格会被转义成 %20，PC 客户端会自动还原；用 nc 手打时要自己写 %20。\n"
     "示例: fs.ls path=/config/nxc\n"
-    "返回: 每行 name=/type=/size=，末行 count= truncated=",
+    "返回: 每行 name=/type=/size=，末行 count= offset= next_offset= truncated=",
 };
 const nxc::MethodInfo kInfoStat = {
     kPath, 1, "read",
@@ -363,10 +556,10 @@ const nxc::MethodInfo kInfoRead = {
     "返回: bytes= offset= eof=，然后一行 #<base64>",
 };
 const nxc::MethodInfo kInfoWrite = {
-    kWrite, 3, "write",
+    kWrite, 4, "write",
     "往 SD 卡写文件（内容走 base64）。\n"
     "★ 单次值上限 4096 字节 ⇒ 大文件必须分块（配合 append=1 一段段追加）。\n"
-    "★ 非法 base64 会被**拒绝**（400），不会像老版本那样静默写出垃圾；空载荷也会被拒。\n"
+    "★ 非法 base64 会被**拒绝**（400），不会像老版本那样静默写出垃圾；空载荷仅在 data= append=0 allow_empty=1 时允许。\n"
     "★ 短写会报错（磁盘满了不会假装成功）。\n"
     "★ 写入留痕：写自己的模块目录 = 自我更新；写 /bootloader = 影响下次开机落点 ——\n"
     "  这两类会单独写一条更醒目的面包屑，便于事后回溯'是谁改的'。\n"
@@ -381,6 +574,16 @@ const nxc::MethodInfo kInfoCopy = {
     "★ 目标父目录必须已存在（先用 fs.mkdir）。\n"
     "示例: fs.copy src=/atmosphere/contents/4200000000000012/exefs.nsp dst=/config/nxc/_prev.nsp\n"
     "返回: src= dst= bytes=",
+};
+const nxc::MethodInfo kInfoRename = {
+    kRename, 4, "write",
+    "在SD卡内重命名普通文件。不存在目标时执行单次rename。\n"
+    "目标存在且replace=1时必须显式提供同父目录不存在的rollback路径；\n"
+    "先dst→rollback保留旧目标，再src→dst发布。失败立即尝试rollback→dst恢复；\n"
+    "回滚失败返回commit-and-rollback-failed，按原请求dst/rollback路径人工恢复；成功保留rollback旧文件。\n"
+    "两次rename间存在掉电/中断窗口，不承诺原子替换；禁止其他客户端并发修改相关路径。\n"
+    "示例: fs.rename src=/config/nxc/stage dst=/config/nxc/live replace=1 rollback=/config/nxc/old\n"
+    "返回: src= dst= result=renamed；替换已有目标时另有rollback=旧目标保留路径",
 };
 const nxc::MethodInfo kInfoMkdir = {
     kPath, 1, "write",
@@ -403,12 +606,15 @@ const nxc::MethodInfo kInfoRm = {
 }  // namespace
 
 const nxc::Method kMethods[] = {
+    {"transfer_info", "声明文件传输分块与在途上限", cmdTransferInfo, &kInfoTransfer},
+    {"sha256", "固定缓冲流式计算普通文件SHA256与长度", cmdSha256, &kInfoSha256},
     {"roots", "列出允许访问的根（现在等于'整张 SD 卡'）", cmdRoots, &kInfoRoots},
     {"ls",    "列目录（最多 200 条，被截断会明确标出）",    cmdLs,    &kInfoLs},
     {"stat",  "看一个路径是否存在/类型/大小",               cmdStat,  &kInfoStat},
     {"read",  "分块读文件（返回 base64；读到 0 字节才算完）", cmdRead,  &kInfoRead},
     {"write", "写文件（base64；非法内容会被拒）",            cmdWrite, &kInfoWrite},
     {"copy",  "复制文件（平台自我更新前备份用）",            cmdCopy,  &kInfoCopy},
+    {"rename", "SD普通文件移动或保留旧目标后替换", cmdRename, &kInfoRename},
     {"mkdir", "建一级目录（已存在算成功）",                  cmdMkdir, &kInfoMkdir},
     {"rm",    "删文件/空目录（失败会回 ERR）",               cmdRm,    &kInfoRm},
 };

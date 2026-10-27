@@ -54,14 +54,11 @@ shasum -a 256 dist/exefs.nsp
 ## 四 部署（不需要 FTP）
 
 ```bash
-cd ~/code/github/NXC && python3 -c "
-import sys; sys.path.insert(0,'pc'); import nxc_mcp
-d = nxc_mcp.Device('<设备IP>', 47800, 60.0)
-print(nxc_mcp.tool_deploy(d, {'local_path':'device/platform/dist/exefs.nsp'}))
-d.close()"
+# 从仓库根目录使用统一入口；已启动的后台应指向目标设备。
+./nxc --ip <设备IP> deploy device/platform/dist/exefs.nsp
 ```
 
-★ **必须看到 `verified: True`**（会读回比 sha256）。**校验不过就别重启。**
+★ **必须看到 `verified` 为 `true`**（会读回比 sha256）。**校验不过就别重启。**
 ★ sysmodule 是开机加载的 ⇒ **部署完必须重启才生效**；重启后主机停在冷启动界面，
   **要人工按 3 次**才能进桌面，那期间所有端口拒绝。
 
@@ -71,8 +68,9 @@ d.close()"
 
 常用手法：
 ```bash
-python3 pc/nxc.py 'identify.id' 'tele.all'        # 基本读数
-python3 pc/nxc_ctl.py act "DRIGHT:120"            # 按键 → 等画面变了
+./nxc call identify.id
+./nxc call tele.all        # 基本读数
+./nxc step "DRIGHT:120"            # 按键 → 等画面变了
 ```
 ★ **旧路径还在时，用"新写法 vs 旧写法逐字节对答案"来验收**（最稳）。
 

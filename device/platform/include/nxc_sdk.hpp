@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <climits>
 
 namespace nxc {
 
@@ -159,17 +160,32 @@ public:
         return nullptr;
     }
 
-    // 取整数；缺失或解析不出时返回 fallback。
+    // 缺失使用默认值；格式错误标记无效，协议层在执行工具之前统一拒绝。
     long long getInt(const char* key, long long fallback) const {
         const char* v = get(key);
-        if (v == nullptr || *v == '\0') return fallback;
+        if (v == nullptr) return fallback;
+        long long value = 0;
+        if (!parseInt(v, &value)) { invalid_ = true; return fallback; }
+        return value;
+    }
+
+    static bool parseInt(const char* v, long long* out) {
+        if (v == nullptr || *v == '\0') return false;
         bool neg = false;
         if (*v == '-') { neg = true; ++v; }
-        long long acc = 0;
+        unsigned long long acc = 0;
+        const unsigned long long limit = neg ? static_cast<unsigned long long>(LLONG_MAX) + 1ULL : LLONG_MAX;
         bool any = false;
-        while (*v >= '0' && *v <= '9') { acc = acc * 10 + (*v - '0'); any = true; ++v; }
-        if (!any) return fallback;
-        return neg ? -acc : acc;
+        while (*v >= '0' && *v <= '9') {
+            const unsigned digit = static_cast<unsigned>(*v - '0');
+            if (acc > (limit - digit) / 10ULL) return false;
+            acc = acc * 10ULL + digit;
+            any = true;
+            ++v;
+        }
+        if (!any || *v != '\0') return false;
+        *out = neg ? (acc == limit ? LLONG_MIN : -static_cast<long long>(acc)) : static_cast<long long>(acc);
+        return true;
     }
 
     bool has(const char* key) const { return get(key) != nullptr; }
@@ -184,17 +200,23 @@ public:
 
     // 由协议层调用；超出容量则丢弃并返回 false。
     bool add(const char* key, const char* value) {
-        if (count_ >= kMaxArgs) return false;
+        if (key == nullptr || *key == '\0' || value == nullptr ||
+            std::strlen(key) >= kArgNameBytes || std::strlen(value) >= kArgValueBytes ||
+            count_ >= kMaxArgs || has(key)) { invalid_ = true; return false; }
         Arg& a = items_[count_++];
         std::snprintf(a.key, sizeof(a.key), "%s", key ? key : "");
         std::snprintf(a.value, sizeof(a.value), "%s", value ? value : "");
         return true;
     }
 
+    bool invalid() const { return invalid_; }
+    void reject() const { invalid_ = true; }
+
 private:
     Arg items_[kMaxArgs];
     int count_ = 0;
     int positional_ = 0;
+    mutable bool invalid_ = false;
 };
 
 // ---------------------------------------------------------------- 应答
@@ -396,6 +418,12 @@ inline int paramSummary(const MethodInfo* mi, char* out, int cap) {
 // 工具**只依赖这一小块能力**，不依赖核心实现细节 —— 这样核心重构不会打断第三方工具。
 namespace host {
 
+// 耗时工具在循环和等待之间检查；睡眠或连接取消时及时让出执行线程。
+bool operationCancelled();
+bool beginNetworkOperation();
+void endNetworkOperation();
+bool sleepMilliseconds(unsigned long long milliseconds);
+
 // 追加一条到内存环形日志（PC 侧可用 log.dump 取走）。sysmodule 没有 stdout，这是唯一的"打印"。
 void log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -504,7 +532,8 @@ inline int b64Value(char c) {
 //   所以"带空白"只能意味着数据坏了，正是该拒的情况。
 inline int b64Decode(const char* in, unsigned char* out, int cap) {
     if (in == nullptr || out == nullptr) return -1;
-    int o = 0, buf = 0, bits = 0;
+    int o = 0, bits = 0;
+    unsigned buf = 0; // 编码流累积移位允许回绕，不能使用有符号溢出。
     bool padded = false;
     for (const char* p = in; *p != '\0'; ++p) {
         if (*p == '=') { padded = true; continue; }   // 填充只允许出现在结尾

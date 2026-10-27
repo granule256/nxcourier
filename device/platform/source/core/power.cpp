@@ -7,6 +7,7 @@
 // ================================================================
 
 #include "power.hpp"
+#include <atomic>
 #include "platform.hpp"
 
 #include <switch.h>
@@ -17,13 +18,13 @@ namespace power {
 namespace {
 
 // ★ 全部是"标志位"，**没有任何 fd**（fd 只由主线程碰，见 power.hpp 的纪律 2）。
-volatile bool g_sleeping      = false;   // 系统已请求睡眠
-volatile bool g_socketsClosed = false;   // 主线程已确认关完
-volatile bool g_acked         = false;   // 通知线程已应答睡眠事件
-volatile bool g_woke          = false;   // 刚醒来，待主循环消费
-volatile int  g_events        = 0;       // 收到的 PSC 事件总数
-volatile int  g_sleepEvents   = 0;       // 其中"睡眠类"状态数
-volatile int  g_lastState     = -1;      // 最近一个 PscPmState
+std::atomic<bool> g_sleeping      = false;   // 系统已请求睡眠
+std::atomic<bool> g_socketsClosed = false;   // 主线程已确认关完
+std::atomic<bool> g_acked         = false;   // 通知线程已应答睡眠事件
+std::atomic<bool> g_woke          = false;   // 刚醒来，待主循环消费
+std::atomic<int>  g_events        = 0;       // 收到的 PSC 事件总数
+std::atomic<int>  g_sleepEvents   = 0;       // 其中"睡眠类"状态数
+std::atomic<int>  g_lastState     = -1;      // 最近一个 PscPmState
 
 PscPmModule g_module;
 Waiter      g_waiter;                    // ★ 照抄 sys-con：等事件用它，不轮询 GetRequest
@@ -213,6 +214,7 @@ bool start(Mode m) {
     if (R_FAILED(rc)) {
         log::ring("power: pscmGetPmModule 失败 rc=0x%08X（id=%d）",
                   static_cast<unsigned>(rc), static_cast<int>(kModuleId));
+        pscmExit();
         return false;
     }
 
@@ -227,11 +229,18 @@ bool start(Mode m) {
         log::ring("power: threadCreate 失败 rc=0x%08X（stack=%p size=%u）",
                   static_cast<unsigned>(rcThread), static_cast<void*>(g_stack),
                   static_cast<unsigned>(sizeof(g_stack)));
+        pscPmModuleFinalize(&g_module);
+        pscPmModuleClose(&g_module);
+        pscmExit();
         return false;
     }
     const Result rcStart = threadStart(&g_thread);
     if (R_FAILED(rcStart)) {
         log::ring("power: threadStart 失败 rc=0x%08X", static_cast<unsigned>(rcStart));
+        threadClose(&g_thread);
+        pscPmModuleFinalize(&g_module);
+        pscPmModuleClose(&g_module);
+        pscmExit();
         return false;
     }
 
@@ -245,9 +254,7 @@ bool sleepAcknowledged() { return g_acked; }
 void reportSocketsClosed() { g_socketsClosed = true; }
 
 bool consumeWoke() {
-    if (!g_woke) return false;
-    g_woke = false;
-    return true;
+    return g_woke.exchange(false, std::memory_order_acq_rel);
 }
 
 int eventCount()      { return g_events; }

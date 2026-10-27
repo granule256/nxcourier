@@ -30,6 +30,7 @@ constexpr int kRingLines     = 128;
 constexpr int kRingLineBytes = 160;
 
 char s_ring[kRingLines][kRingLineBytes];
+Mutex s_ringMutex = 0;
 int  s_ringHead  = 0;
 int  s_ringCount = 0;
 int  s_boot      = 0;
@@ -63,9 +64,11 @@ int readBootCount() {
 }
 
 void ringLine(const char* text) {
+    mutexLock(&s_ringMutex);
     std::snprintf(s_ring[s_ringHead], kRingLineBytes, "%s", text);
     s_ringHead = (s_ringHead + 1) % kRingLines;
     if (s_ringCount < kRingLines) ++s_ringCount;
+    mutexUnlock(&s_ringMutex);
 }
 
 }  // namespace
@@ -170,6 +173,7 @@ void ring(const char* fmt, ...) {
 }
 
 void dump(Reply& reply, int maxLines) {
+    mutexLock(&s_ringMutex);
     if (maxLines < 0) maxLines = 0;
     if (maxLines > s_ringCount) maxLines = s_ringCount;
     if (maxLines > kRingLines) maxLines = kRingLines;
@@ -182,6 +186,7 @@ void dump(Reply& reply, int maxLines) {
         reply.raw(s_ring[idx]);
         idx = (idx + 1) % kRingLines;
     }
+    mutexUnlock(&s_ringMutex);
 }
 
 int bootCount() { return s_boot; }

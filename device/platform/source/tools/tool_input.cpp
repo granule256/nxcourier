@@ -31,6 +31,7 @@
 // ★ 摇杆取值范围：`HidAnalogStickState` 是 s32，**中心是 0**，满偏约 ±32767。
 //   （注意这与 DebugPad 那套 0..255 / 128 中位**不是一回事**，别混。）
 #include "nxc_sdk.hpp"
+#include "input_sequence.hpp"
 
 #include <switch.h>
 
@@ -176,13 +177,6 @@ void cmdStatus(const nxc::Args&, nxc::Reply& r) {
 }
 
 void cmdPress(const nxc::Args& a, nxc::Reply& r) {
-    const char* stage = "";
-    const Result rcInit = ensurePad(&stage);
-    if (R_FAILED(rcInit)) {
-        r.failf(503, "attach-failed stage=%s rc=0x%08X", stage, static_cast<unsigned>(rcInit));
-        return;
-    }
-
     u64 buttons = 0;
     char bad[24] = {0};
     const char* spec = a.get("buttons");
@@ -195,13 +189,22 @@ void cmdPress(const nxc::Args& a, nxc::Reply& r) {
     long long holdMs = a.getInt("hold_ms", 120);
     if (holdMs < 0 || holdMs > 10000) { r.fail(400, "hold_ms-out-of-range-0..10000"); return; }
 
-    const s32 lx = static_cast<s32>(a.getInt("lx", 0));
-    const s32 ly = static_cast<s32>(a.getInt("ly", 0));
-    const s32 rx = static_cast<s32>(a.getInt("rx", 0));
-    const s32 ry = static_cast<s32>(a.getInt("ry", 0));
+    const long long lx = a.getInt("lx", 0), ly = a.getInt("ly", 0);
+    const long long rx = a.getInt("rx", 0), ry = a.getInt("ry", 0);
+    if (a.invalid() || lx < -32767 || lx > 32767 || ly < -32767 || ly > 32767 ||
+        rx < -32767 || rx > 32767 || ry < -32767 || ry > 32767) {
+        r.fail(400, "stick-out-of-range: 允许-32767..32767"); return;
+    }
 
     if (buttons == 0 && lx == 0 && ly == 0 && rx == 0 && ry == 0) {
         r.fail(400, "nothing-to-press");
+        return;
+    }
+
+    const char* stage = "";
+    const Result rcInit = ensurePad(&stage);
+    if (R_FAILED(rcInit)) {
+        r.failf(503, "attach-failed stage=%s rc=0x%08X", stage, static_cast<unsigned>(rcInit));
         return;
     }
 
@@ -212,10 +215,11 @@ void cmdPress(const nxc::Args& a, nxc::Reply& r) {
         r.fail(500, "SetHdlsState-failed");
         return;
     }
-    if (holdMs > 0) svcSleepThread(static_cast<u64>(holdMs) * 1000000ULL);
+    const bool waited = nxc::host::sleepMilliseconds(static_cast<unsigned long long>(holdMs));
 
     // ★ 无论如何都回到"不按"的状态 —— 不留下按死的键。
-    applyState(0, 0, 0, 0, 0);
+    if (!applyState(0, 0, 0, 0, 0)) { r.fail(500, "release-failed"); return; }
+    if (!waited) { r.fail(409, "operation-cancelled"); return; }
 
     r.kvf("buttons", "0x%llX", buttons);
     r.kvi("hold_ms", holdMs);
@@ -227,7 +231,7 @@ void cmdRelease(const nxc::Args&, nxc::Reply& r) {
     const char* stage = "";
     if (R_FAILED(ensurePad(&stage))) { r.failf(503, "attach-failed stage=%s", stage); return; }
     nxc::host::breadcrumb("input.release");
-    applyState(0, 0, 0, 0, 0);
+    if (!applyState(0, 0, 0, 0, 0)) { r.fail(500, "release-failed"); return; }
     r.kv("result", "released");
 }
 
@@ -255,104 +259,35 @@ void cmdDetach(const nxc::Args&, nxc::Reply& r) {
 //
 // ★ 仍然遵守"按完必松开"：每一步都是 按下→保持→松开，不会留下按死的键。
 void cmdSeq(const nxc::Args& a, nxc::Reply& r) {
-    const char* stage = "";
-    const Result rcInit = ensurePad(&stage);
-    if (R_FAILED(rcInit)) {
-        r.failf(503, "attach-failed stage=%s rc=0x%08X", stage, static_cast<unsigned>(rcInit));
-        return;
+    static nxc::input::Plan plan;
+    const long long defaultHold = a.getInt("default_hold_ms", 120);
+    auto parse = [](const char* name, uint64_t* buttons) {
+        u64 bits=0; char bad[24]{};
+        if (!parseButtons(name, &bits, bad, sizeof(bad))) return false;
+        *buttons=bits; return true;
+    };
+    if (a.invalid() || !nxc::input::parsePlan(a.get("steps"), defaultHold, parse, plan)) {
+        r.fail(400, "invalid-steps: 名字:毫秒;WAIT:毫秒；每步0..10000ms，最多256步及总时长60000ms，整串拒绝执行"); return;
     }
-
-    const char* spec = a.get("steps");
-    if (spec == nullptr || *spec == '\0') {
-        // ★★★ 2026-10-06 晚：原来 `fail` 之后的 `raw("usage: …")` **发不出去**（ERR 不带载荷）
-        //   ⇒ 折进错误消息（语法是必须告诉调用方的东西）。
-        r.failf(400, "missing-steps: 需要 steps=<动作串>，形如 steps=DRIGHT:150;WAIT:300;A:120"
-                     "（分号分隔；WAIT:n 为纯等待）");
-        return;
+    const char* stage="";
+    const Result init=ensurePad(&stage);
+    if (R_FAILED(init)) { r.failf(503,"attach-failed stage=%s rc=0x%08X",stage,static_cast<unsigned>(init)); return; }
+    int completed=0;
+    for (int i=0;i<plan.count;++i) {
+        if (nxc::host::operationCancelled()) {
+            applyState(0,0,0,0,0); r.failf(409,"operation-cancelled completed_steps=%d",completed); return;
+        }
+        const auto& step=plan.steps[i];
+        if (step.buttons && !applyState(step.buttons,0,0,0,0)) {
+            applyState(0,0,0,0,0); r.failf(500,"input-failed completed_steps=%d",completed); return;
+        }
+        const bool waited=nxc::host::sleepMilliseconds(step.milliseconds);
+        const bool released=applyState(0,0,0,0,0);
+        if (!released) { r.failf(500,"release-failed completed_steps=%d",completed); return; }
+        if (!waited) { r.failf(409,"operation-cancelled completed_steps=%d",completed); return; }
+        ++completed;
     }
-
-    long long defaultHold = a.getInt("default_hold_ms", 120);
-    bool holdAdjusted = false;
-    if (defaultHold < 0 || defaultHold > 5000) { defaultHold = 120; holdAdjusted = true; }
-
-    nxc::host::breadcrumb("input.seq %s", spec);
-
-    const u64 startTick = armGetSystemTick();
-    int stepCount = 0;
-    int failed = 0;
-
-    const char* p = spec;
-    while (*p != '\0') {
-        // 取一段（到分号或结尾）
-        char step[80];
-        int n = 0;
-        while (*p != '\0' && *p != ';') {
-            if (n < static_cast<int>(sizeof(step)) - 1) step[n++] = *p;
-            ++p;
-        }
-        step[n] = '\0';
-        if (*p == ';') ++p;
-        if (n == 0) continue;
-
-        // 拆成 名字:毫秒
-        char name[48];
-        int m = 0;
-        const char* q2 = step;
-        while (*q2 != '\0' && *q2 != ':') {
-            if (m < static_cast<int>(sizeof(name)) - 1) name[m++] = *q2;
-            ++q2;
-        }
-        name[m] = '\0';
-        long long ms = defaultHold;
-        if (*q2 == ':') {
-            ms = 0;
-            for (const char* d = q2 + 1; *d >= '0' && *d <= '9'; ++d) ms = ms * 10 + (*d - '0');
-        }
-        if (ms < 0) ms = 0;
-        if (ms > 10000) ms = 10000;
-
-        ++stepCount;
-        if (strcasecmp(name, "WAIT") == 0) {
-            if (ms > 0) svcSleepThread(static_cast<u64>(ms) * 1000000ULL);
-            continue;
-        }
-
-        u64 buttons = 0;
-        char bad[24] = {0};
-        if (!parseButtons(name, &buttons, bad, sizeof(bad))) {
-            ++failed;
-            nxc::host::log("input.seq: 不认识的键 %s", bad);
-            continue;
-        }
-        if (buttons == 0) continue;
-
-        if (!applyState(buttons, 0, 0, 0, 0)) { ++failed; continue; }
-        if (ms > 0) svcSleepThread(static_cast<u64>(ms) * 1000000ULL);
-        applyState(0, 0, 0, 0, 0);      // 每步都松开，不留按死的键
-    }
-
-    const long long elapsed =
-        static_cast<long long>(armTicksToNs(armGetSystemTick() - startTick) / 1000000ULL);
-
-    // ★★★ 2026-10-06 晚：**有步骤失败就回错误**，不再回 `OK steps=1 failed=1`。
-    //   原来的形态要求调用方自己去读 `failed=`；实测 `steps=zzz` 回的是 OK ⇒
-    //   "按键没执行"看起来像"执行了"。现在把计数折进错误消息，信息一点不少。
-    if (failed > 0) {
-        r.failf(400, "seq-had-failures steps=%lld failed=%lld elapsed_ms=%lld"
-                     "（名字不认识的键会被跳过，可用 input.status 看可用键名）",
-                static_cast<long long>(stepCount), static_cast<long long>(failed), elapsed);
-        return;
-    }
-
-    r.kvi("steps", stepCount);
-    r.kvi("failed", 0);
-    r.kvi("elapsed_ms", elapsed);
-    if (holdAdjusted) {   // ★ 与其他方法一致：越界不静默
-        r.next();
-        r.kv("note_params", "default_hold_ms 越界（允许 0..5000），已按默认 120 执行");
-    }
-    r.raw("note: 每步都是「按下→保持→松开」，不会留按死的键");
-    r.raw("tip: 跑完接一次 screen.wait_change，就知道这串动作有没有生效");
+    r.kvi("steps",completed); r.kvi("failed",0); r.kvi("elapsed_ms",plan.totalMs);
 }
 
 // ---------------------------------------------------------------- 自描述元数据

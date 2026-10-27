@@ -6,18 +6,9 @@
 // 完整条款见仓库根目录的 LICENSE。
 // ================================================================
 
-// 内置工具 · title：主机上"有什么、在跑什么"。
-//
-// 依据：M1 探针实测 `ns` / `ncm` / `pmdmnt` / `pminfo` / `pmshell` 在 sysmodule 里**全部可用**
-//（`pmshell` 就是"启动/结束 title"的前提）。
-//
-// 本轮只做**只读**部分：
-//   title.list    已安装应用（application_id + 最后更新时间）
-//   title.current 当前在跑什么（应用进程 id → program id）
-//   title.name    读 NACP 拿应用名/作者/版本
-//
-// 写入类（`title.launch` / `title.terminate`，前提是 `pmshellLaunchProgram`）留到下一轮 ——
-// 它们会改变主机状态，必须单独设计确认流程与验证时机。
+// 内置工具 · title：应用查询、显式启动和结束。
+// 普通应用启动只使用 libnx 公开接口；当前固件超出支持范围时明确拒绝，
+// 不构造未经证实的 IApplicationManagerInterface IPC。
 #include "nxc_sdk.hpp"
 
 #include <switch.h>
@@ -205,170 +196,104 @@ void cmdProcesses(const nxc::Args&, nxc::Reply& r) {
 void cmdLaunch(const nxc::Args& a, nxc::Reply& r) {
     const char* token = a.get("confirm");
     if (token == nullptr || std::strcmp(token, kLaunchToken) != 0) {
-        // ★★★ 2026-10-06 晚：原来 `fail` 之后的 `raw("usage: …")` **发不出去**（ERR 不带载荷）
-        //   ⇒ 调用方只知道被拒、不知道该带哪个口令。折进消息里。
-        //   ★ 另外把「启动游戏这条路实测走不通、替代是用 input 按 A」也一并告诉它 ——
-        //     否则 AI 会反复试一条已经验证过不通的路。
-        //   ★ 消息长度要控制在 `errDetail_[256]` 以内（超了会被截断），所以这里只留
-        //     「口令 + 替代做法」，完整用法让调用方去看 help title。
-        r.failf(403, "refusing-without-confirm-token: 需要 confirm=%s。"
-                     "★ 实测「启动游戏」走不通（applet 被拒 0x1159、program 会挂住）；"
-                     "替代：用 input 在主界面按 A",
-                kLaunchToken);
+        r.failf(403, "refusing-without-confirm-token: 需要 confirm=%s", kLaunchToken);
+        return;
+    }
+    const char* mode = a.get("mode");
+    if (mode == nullptr || *mode == '\0') mode = "application";
+    if (std::strcmp(mode, "application") != 0 && std::strcmp(mode, "applet") != 0 &&
+        std::strcmp(mode, "program") != 0 && std::strcmp(mode, "libapplet") != 0) {
+        r.fail(400, "mode-must-be-application|applet|program|libapplet");
+        return;
+    }
+
+    // 保留原有显式实验接口；它不是普通应用启动的自动回退路径。
+    if (std::strcmp(mode, "libapplet") == 0) {
+        const long long id = a.getInt("applet", 0x0C);
+        nxc::host::breadcrumb("title.launch LIBAPPLET id=0x%llX",
+                              static_cast<unsigned long long>(id));
+        const Result init = appletInitialize();
+        if (R_FAILED(init)) { r.failf(503, "applet-unavailable rc=0x%08X", init); return; }
+        AppletHolder holder{};
+        const Result created = appletCreateLibraryApplet(
+            &holder, static_cast<AppletId>(id), LibAppletMode_AllForeground);
+        if (R_FAILED(created)) {
+            appletExit();
+            r.failf(500, "libapplet-create-failed rc=0x%08X", created);
+            return;
+        }
+        const Result started = appletHolderStart(&holder);
+        if (R_SUCCEEDED(started)) appletHolderRequestExitOrTerminate(&holder, 3000000000ULL);
+        appletHolderClose(&holder);
+        appletExit();
+        if (R_FAILED(started)) { r.failf(500, "libapplet-start-failed rc=0x%08X", started); return; }
+        r.kvf("applet_id", "0x%02llX", static_cast<unsigned long long>(id));
+        r.kv("result", "started-and-exit-requested");
         return;
     }
 
     u64 appId = 0;
-    if (!parseId(a.get("app"), &appId)) { r.fail(400, "missing-or-bad-app"); return; }
-
+    if (!parseId(a.get("app"), &appId) || appId == 0) { r.fail(400, "missing-or-bad-app"); return; }
     const u8 storage = storageIdFromName(a.get("storage"));
     if (storage == 0xFF) { r.fail(400, "storage-must-be-any|sd|user|system|gc"); return; }
 
-    const char* mode = a.get("mode");
-    if (mode == nullptr || *mode == '\0') mode = "applet";
-
-    // ★★★ 2026-10-06 晚：**mode 必须走白名单**。
-    //   原来只判断 "applet" / "libapplet"，**其余任何值（包括写错的）**都会落到最后那条
-    //   `pmshellLaunchProgram` 兜底路 —— 而那条路实测**会把请求挂住 60 秒以上**
-    //   （代码注释里自己写着的）。⇒ 一个拼错的参数就能把整个平台拖住 60 秒，
-    //   绝不能让这种失败形态存在。拼错就当场拒绝，并把正确取值告诉调用方。
-    if (std::strcmp(mode, "applet") != 0 && std::strcmp(mode, "program") != 0 &&
-        std::strcmp(mode, "libapplet") != 0) {
-        r.failf(400, "bad-mode: mode 只接受 applet|program|libapplet（当前=%s）。"
-                     "★ applet 实测被拒 0x1159；program 实测会挂住 60 秒以上，慎用",
-                mode);
+    if (std::strcmp(mode, "application") == 0) {
+        // libnx ns.h: nsdevLaunchApplicationWithStorageIdForDevelop [1.0.0-17.0.1]。
+        // nsGetApplicationManagerInterface 仅返回会话，不等于公开的启动封装。
+        // appletCreateApplication 需要 SystemApplet 身份，本模块为 AppletType_None。
+        const u32 version = hosversionGet();
+        if (version < MAKEHOSVERSION(1, 0, 0) || version > MAKEHOSVERSION(17, 0, 1)) {
+            r.fail(409, "application-launch-unsupported: libnx nsdev 支持 1.0.0..17.0.1；当前固件无已实现的普通应用启动接口。请用户判图后操作主界面");
+            return;
+        }
+        const Result init = nsdevInitialize();
+        if (R_FAILED(init)) { r.failf(503, "nsdev-unavailable rc=0x%08X", init); return; }
+        nxc::host::breadcrumb("title.launch APPLICATION app=0x%llX storage=%u",
+                              static_cast<unsigned long long>(appId), storage);
+        u64 pid = 0;
+        const Result rc = nsdevLaunchApplicationWithStorageIdForDevelop(
+            &pid, appId, 0, storage, NcmStorageId_Any);
+        nsdevExit();
+        if (R_FAILED(rc)) { r.failf(500, "application-launch-failed rc=0x%08X", rc); return; }
+        r.kvf("app", "0x%016llX", static_cast<unsigned long long>(appId));
+        r.kvi("pid", static_cast<long long>(pid));
+        r.kv("mode", "application");
+        r.kv("result", "launch-requested");
+        r.kv("note", "需用 title.current 和用户判图确认启动结果；此路径尚未真机验收");
         return;
     }
 
-    // ★★★ 实验路径：**sysmodule 到底能不能启动 library applet？**
-    //
-    // 为什么这条最重要：`appletRequestLaunchApplication`（启动游戏）的注释明确写着
-    // "Only available with AppletType_*Application, or AppletType_LibraryApplet"
-    // —— 我们的 sysmodule 两者都不是，所以实测被拒（rc=0x1159）。
-    //
-    // 但 `appletCreateLibraryApplet` 的注释**没有这条限制**。
-    // 如果 sysmodule 能启动 library applet，那么：
-    //     sysmodule → 启动一个库小程序（它有 applet 身份）→ 由它去调 appletRequestLaunchApplication
-    // ⇒ **"启动游戏"这条死角就有解了**（而且不用模拟输入、不用模拟按键）。
-    //
-    // 这条路径只做"创建 + 启动 + 请求退出"，把两个 rc 原样报出来：
-    //   * rc 是权限类错误 ⇒ 这条路堵死，如实上报
-    //   * rc 是"找不到那个 applet"之类 ⇒ **说明权限过了**，只是需要我们自己提供一个库小程序
-    if (std::strcmp(mode, "libapplet") == 0) {
-        long long id = a.getInt("applet", 0x0C);   // 默认 0x0C = controller（手柄设置，无害可见）
-        nxc::host::breadcrumb("title.launch LIBAPPLET id=0x%llX",
-                              static_cast<unsigned long long>(id));
-        if (R_FAILED(appletInitialize())) {
-            r.fail(503, "applet-unavailable");
-            return;
-        }
-        AppletHolder holder;
-        const Result rcCreate = appletCreateLibraryApplet(
-            &holder, static_cast<AppletId>(id), LibAppletMode_AllForeground);
-        if (R_FAILED(rcCreate)) {
-            appletExit();
-            // ★★★ 2026-10-06 晚：**失败回 ERR**。原来回的是 `OK` + `result=创建失败`，
-            //   把"这条路走不通"写进了成功回包（调用方不看字段就会以为 applet 能启动）。
-            //   读法（权限类 = 堵死 / 找不到 applet = 权限过了）一并折进消息里 —— 原来那句
-            //   `raw` 提示在 OK 分支还能看到，改成 ERR 之后 raw 会被丢掉。
-            r.failf(500, "libapplet-create-failed applet_id=0x%02llX create_rc=0x%08X"
-                         "（权限类错误 ⇒ 这条路堵死；找不到 applet 之类 ⇒ 权限这关过了）",
-                    static_cast<unsigned long long>(id), static_cast<unsigned>(rcCreate));
-            return;
-        }
-        const Result rcStart = appletHolderStart(&holder);
-        if (R_FAILED(rcStart)) {
-            appletHolderClose(&holder);
-            appletExit();
-            r.failf(500, "libapplet-start-failed applet_id=0x%02llX start_rc=0x%08X",
-                    static_cast<unsigned long long>(id), static_cast<unsigned>(rcStart));
-            return;
-        }
-        // 让它自己退，别留在屏幕上
-        appletHolderRequestExitOrTerminate(&holder, 3000000000ULL);
-        appletHolderClose(&holder);
-        appletExit();
-        r.kvf("applet_id", "0x%02llX", static_cast<unsigned long long>(id));
-        r.kv("result", "★ 成功了 —— sysmodule 能启动 library applet");
-        return;
-    }
-
-    // ★★ 实测教训：启动"应用"要走 **applet 管理器**，不能走 `pm:shell`。
-    //
-    // 第一版只用了 `pmshellLaunchProgram`，真机上**每个 storage 值都失败**：
-    //     sd → 0x00000408 (fs)   system → 0x00000408   gc → 0x00020A05 (ncm)
-    //     user → 0xCA47D802      any → 0x00001805
-    // 那一族接口是给"启动普通程序"用的，不是给"启动游戏"用的。
-    //
-    // 正道是 `appletRequestLaunchApplication(app_id, NULL)` ——
-    // HOME 菜单点一个游戏时走的就是它（它把请求交给 applet 管理器去真正启动）。
-    nxc::host::breadcrumb("title.launch app=0x%llX mode=%s storage=%u",
+    nxc::host::breadcrumb("title.launch EXPERIMENTAL app=0x%llX mode=%s storage=%u",
                           static_cast<unsigned long long>(appId), mode, storage);
-
-    Result rcApplet = 0;
-    Result rcProgram = 0;
-    bool appletTried = false;
-
     if (std::strcmp(mode, "applet") == 0) {
-        appletTried = true;
-        if (R_SUCCEEDED(appletInitialize())) {
-            rcApplet = appletRequestLaunchApplication(appId, nullptr);
-            appletExit();
-        } else {
-            rcApplet = -1;
-        }
-        if (R_SUCCEEDED(rcApplet)) {
-            r.kvf("app", "0x%016llX", static_cast<unsigned long long>(appId));
-            r.kv("mode", "applet");
-            r.kv("result", "launch-requested");
-            r.raw("note: 这是「请求启动」，游戏是异步起来的 —— 稍等一下再用 title.current 确认");
+        const Result init = appletInitialize();
+        if (R_FAILED(init)) { r.failf(503, "applet-unavailable rc=0x%08X", init); return; }
+        const Result rc = appletRequestLaunchApplication(appId, nullptr);
+        appletExit();
+        if (R_FAILED(rc)) {
+            r.failf(500, "applet-launch-failed rc=0x%08X；sysmodule 非 Application/LibraryApplet；未自动回退", rc);
             return;
         }
-        // ★★ 这里**故意不自动回退**。
-        //   实测：applet 路径返回 0x1159 之后自动去试 `pmshellLaunchProgram`，
-        //   那个调用**把请求挂住了 60 秒以上**（PC 侧 timeout 断连）。
-        //   **"挂住"比"报错"糟得多** —— 调用方既拿不到结果也不知道发生了什么事。
-        //   要试 program 路径，请**显式**传 mode=program。
-        nxc::host::log("title.launch: applet 路径失败 rc=0x%08X",
-                       static_cast<unsigned>(rcApplet));
-        // ★★★ 2026-10-06 晚：原来这里 failf 之后跟着三行 `raw("note: …")` ——
-        //   **ERR 不带载荷 ⇒ 那三行（含"已验证可行的替代"）一句也发不出去**，
-        //   调用方只看到一句 `applet-launch-failed rc=0x1159`，然后会**反复去试一条
-        //   已经验证过不通的路**。现在把这些折进错误消息里。
-        r.failf(500, "applet-launch-failed rc=0x%08X（applet 管理器拒绝了。想试 pm:shell 那条路请"
-                     "把 mode 显式设成 program，但实测它会挂住）"
-                     "★ 已验证可行的替代：用 input 在主界面按 A 启动",
-                static_cast<unsigned>(rcApplet));
+        r.kvf("app", "0x%016llX", static_cast<unsigned long long>(appId));
+        r.kv("mode", "applet");
+        r.kv("result", "launch-requested");
         return;
     }
 
-    // 兜底：老的 program 路径（实测对应用不管用，但对"普通程序"可能有用）
-    if (R_FAILED(pmshellInitialize())) {
-        r.failf(503, "pmshell-unavailable applet_rc=0x%08X", static_cast<unsigned>(rcApplet));
-        return;
-    }
-
-    NcmProgramLocation location;
-    std::memset(&location, 0, sizeof(location));
+    // pm:shell 启动 program，不承诺可启动普通应用；原接口仅显式保留。
+    const Result init = pmshellInitialize();
+    if (R_FAILED(init)) { r.failf(503, "pmshell-unavailable rc=0x%08X", init); return; }
+    NcmProgramLocation location{};
     location.program_id = appId;
     location.storageID = storage;
-
     u64 pid = 0;
-    rcProgram = pmshellLaunchProgram(PmLaunchFlag_None, &location, &pid);
+    const Result rc = pmshellLaunchProgram(PmLaunchFlag_None, &location, &pid);
     pmshellExit();
-
-    if (R_FAILED(rcProgram)) {
-        r.failf(500, "launch-failed applet_rc=0x%08X program_rc=0x%08X program_tried=%d storage=%u",
-                static_cast<unsigned>(rcApplet), static_cast<unsigned>(rcProgram),
-                appletTried ? 1 : 0, storage);
-        return;
-    }
-
+    if (R_FAILED(rc)) { r.failf(500, "program-launch-failed rc=0x%08X storage=%u", rc, storage); return; }
     r.kvf("app", "0x%016llX", static_cast<unsigned long long>(appId));
-    r.kv("mode", "program");
-    r.kvi("storage", storage);
     r.kvi("pid", static_cast<long long>(pid));
-    r.kv("result", "launched");
+    r.kv("mode", "program");
+    r.kv("result", "launch-requested");
 }
 
 void cmdTerminate(const nxc::Args& a, nxc::Reply& r) {
@@ -376,7 +301,7 @@ void cmdTerminate(const nxc::Args& a, nxc::Reply& r) {
     if (token == nullptr || std::strcmp(token, kTerminateToken) != 0) {
         // ★★★ 2026-10-06 晚：原来 fail 之后的三行 raw（usage/warn/note）**都发不出去**。
         r.failf(403, "refusing-without-confirm-token: 需要 confirm=%s。"
-                     "mode=program 不弹错误框；mode=process 会弹「发生错误，软件已关闭」。"
+                     "关闭后可能出现系统提示框，需用户判图后明确确认下一次按键。"
                      "★ 会丢未保存进度",
                 kTerminateToken);
         return;
@@ -407,12 +332,7 @@ void cmdTerminate(const nxc::Args& a, nxc::Reply& r) {
         }
     }
 
-    // ★ 两种终止方式，实测区别很大：
-    //   mode=program（默认）—— `pmshellTerminateProgram(program_id)`：
-    //       这是"关闭程序"那条路，**不给游戏留错误框**。
-    //   mode=process      —— `pmshellTerminateProcess(pid)`：直接杀进程。
-    //       ★ 实测副作用：屏幕上会弹系统提示「发生错误，软件已关闭」需要手动确认。
-    //   （用 pid 发起时要先把 program id 反查出来 —— `pmdmntGetProgramId`。）
+    // 两种终止方式都可能出现系统提示；不能根据返回值或截图大小决定按键。
     const char* mode = a.get("mode");
     if (mode == nullptr || *mode == '\0') mode = "program";
 
@@ -468,9 +388,9 @@ const nxc::Param kName[] = {
 };
 const nxc::Param kLaunch[] = {
     {"confirm", "str", true,  nullptr, "确认口令：必须逐字符等于 I-KNOW-THIS-LAUNCHES"},
-    {"app",     "str", false, nullptr, "要启动的 title id（0x...）；mode=applet|program 时必填"},
-    {"storage", "str", false, "any",   "any|sd|user|system|gc；仅 mode=program 用到"},
-    {"mode",    "str", false, "applet","applet|program|libapplet；默认 applet"},
+    {"app",     "str", false, nullptr, "要启动的 title id（0x...）；仅 mode=libapplet 可省略"},
+    {"storage", "str", false, "any",   "any|sd|user|system|gc；application/program 使用，patch storage 为 any"},
+    {"mode",    "str", false, "application","application|applet|program|libapplet；后三者为显式实验接口"},
     {"applet",  "int", false, "12",    "仅 mode=libapplet：库小程序 id（十进制）；默认 12 即 0x0C（手柄设置）"},
 };
 const nxc::Param kTerminate[] = {
@@ -525,22 +445,17 @@ const nxc::MethodInfo kInfoProcesses = {
 };
 const nxc::MethodInfo kInfoLaunch = {
     kLaunch, 5, "action",
-    "启动应用 / 库小程序。★ 会改变主机状态，必须带确认口令。\n"
-    "作用: 让主机把某个 title 跑起来（或启动一个库小程序）。\n"
-    "参数: confirm 必填，必须逐字符等于 I-KNOW-THIS-LAUNCHES（缺或错回 403，错误消息里会直接告诉你该带哪个）。\n"
-    "      app = title id（0x...），mode=applet|program 时必填。\n"
-    "      mode 默认 applet；storage 默认 any（仅 program 用到）；applet 默认 12（仅 libapplet 用到，只认十进制）。\n"
+    "请求启动应用；必须 confirm=I-KNOW-THIS-LAUNCHES。\n"
+    "默认 mode=application：使用 libnx nsdevLaunchApplicationWithStorageIdForDevelop，\n"
+    "仅支持固件 1.0.0..17.0.1；其他版本或版本未知回 409，不猜测 IPC、不自动回退。\n"
+    "该旧固件接口已交叉编译，尚未真机验收；当前 22.5 固件普通应用启动仍不支持。\n"
+    "参数: app=0x...；storage=any|sd|user|system|gc，默认 any；patch storage 固定 any。\n"
     "示例: title.launch app=0x010015100B514000 confirm=I-KNOW-THIS-LAUNCHES\n"
-    "      title.launch app=0x010015100B514000 confirm=I-KNOW-THIS-LAUNCHES mode=program storage=sd\n"
-    "      title.launch mode=libapplet applet=12 confirm=I-KNOW-THIS-LAUNCHES\n"
-    "★★ 注意: 「启动游戏」这条路**实测走不通**——\n"
-    "      · mode=applet：appletRequestLaunchApplication 被拒，rc=0x1159（sysmodule 不是 Application/LibraryApplet 身份）。\n"
-    "      · mode=program：pmshellLaunchProgram 各 storage 都失败，而且**会挂住 60 秒以上**（PC 侧 timeout 断连）。\n"
-    "      所以代码**故意不做自动回退**（applet 失败后自动去试 program 正是挂住的来源）；要试 program 请显式传 mode=program。\n"
-    "★★ 已验证可行的替代: 用 input 在主界面按 A 启动游戏（先用 title.current 确认停在主界面）。\n"
-    "注意: mode=libapplet 可用来启动一个「库小程序」（如 0x0C 手柄设置），成功说明 sysmodule 能启动库小程序。\n"
-    "返回: applet 模式回 result=launch-requested；program 模式回 result=launched pid=；libapplet 成功回 result=成功。\n"
-    "相关: title.current（确认是否起来了）、title.list、input（按 A 启动的替代）",
+    "原有显式实验模式保留：mode=applet 需要 Application/LibraryApplet 身份，本 sysmodule 不具备；\n"
+    "mode=program 调 pm:shell，曾出现长时间阻塞，不作为普通应用启动方案；\n"
+    "mode=libapplet applet=12 创建库小程序并请求退出，不证明可启动普通应用。\n"
+    "返回: 请求成功不等于画面已可用，需 title.current 并由用户判图确认。\n"
+    "需要主界面输入时先截图、由用户明确确认选中项及下一步，再调用 input；禁止盲按 A。",
 };
 const nxc::MethodInfo kInfoTerminate = {
     kTerminate, 4, "action",
@@ -550,8 +465,8 @@ const nxc::MethodInfo kInfoTerminate = {
     "      app / pid 二选一（pid 优先）；mode 默认 program。\n"
     "示例: title.terminate app=0x010015100B514000 confirm=I-KNOW-THIS-CLOSES\n"
     "      title.terminate pid=1234 confirm=I-KNOW-THIS-CLOSES mode=process\n"
-    "★ 注意: mode=program（默认）走 pmshellTerminateProgram，**不弹错误框**；\n"
-    "      mode=process 走 pmshellTerminateProcess，屏幕上会弹「发生错误，软件已关闭」需手动确认。\n"
+    "注意: program 走 pmshellTerminateProgram，process 走 pmshellTerminateProcess；\n"
+    "两种方式都可能出现系统提示，需用户看截图明确确认后才执行下一次输入。\n"
     "注意: 只给 app 时内部会先用 pmshellGetProcessId 反查 pid；没在跑会回 404 no-such-running-process。\n"
     "返回: mode= pid= result=terminated（给了 app 时还回 app=0x...）。\n"
     "相关: title.processes（拿 pid）、title.current",
@@ -575,8 +490,8 @@ NXC_DEFINE_TOOL_EX(nxc_tool_title, "title",
     "  · title.list 列出已安装应用拿 title id，再用 title.name 换成人能读的名字\n"
     "  · title.current / title.processes 看现在在跑什么（决定能不能安全操作前先看）\n"
     "  · title.launch / title.terminate 启动或关闭应用（都要确认口令 且会改主机状态）\n"
-    "★ 启动游戏这条路实测走不通：applet 被拒 0x1159、program 会挂住 60 秒以上（所以不自动回退）。\n"
-    "★ 已验证可行的替代：用 input 在主界面按 A 启动。\n"
+    "普通应用默认走 nsdev，仅支持 1.0.0..17.0.1，尚未真机验收；其他固件回 409。\n"
+    "显式实验模式不自动回退；主界面输入必须先由用户判图明确确认。\n"
     "★ 口令：launch 要 I-KNOW-THIS-LAUNCHES；terminate 要 I-KNOW-THIS-CLOSES。\n"
     "★ 缺口令或口令错会回 403 且错误消息里会直接告诉你该带哪个。\n"
     "相关工具：input（模拟按键 含按 A 启动）\n"

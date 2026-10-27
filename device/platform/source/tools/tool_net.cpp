@@ -62,11 +62,17 @@ const Dep kDeps[] = {
 // out_errno 回报失败的底层原因（ECONNREFUSED = 有人接但拒绝 / ETIMEDOUT = 没响应）。
 bool probeTcp(u32 ipHostOrder, u16 port, int timeoutMs, int* outErrno) {
     *outErrno = 0;
+    if (!nxc::host::beginNetworkOperation()) { *outErrno=ECANCELED; return false; }
+    struct Operation { ~Operation() { nxc::host::endNetworkOperation(); } } operation;
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { *outErrno = errno; return false; }
 
     const int flags = ::fcntl(fd, F_GETFL, 0);
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK)<0) {
+        *outErrno=errno; ::close(fd); return false;
+    }
+    const int actualFlags=::fcntl(fd,F_GETFL,0);
+    if(actualFlags<0 || !(actualFlags&O_NONBLOCK)) { *outErrno=EINVAL; ::close(fd); return false; }
 
     sockaddr_in addr;
     std::memset(&addr, 0, sizeof(addr));
@@ -83,13 +89,18 @@ bool probeTcp(u32 ipHostOrder, u16 port, int timeoutMs, int* outErrno) {
         p.fd = fd;
         p.events = POLLOUT;
         p.revents = 0;
-        if (::poll(&p, 1, timeoutMs) > 0) {
+        int ready=0;
+        for(int elapsed=0; elapsed<timeoutMs && !nxc::host::operationCancelled(); elapsed+=50) {
+            ready=::poll(&p,1,timeoutMs-elapsed<50?timeoutMs-elapsed:50);
+            if(ready>0 || (ready<0 && errno!=EINTR)) break;
+        }
+        if (ready > 0 && !nxc::host::operationCancelled()) {
             int err = 0;
             socklen_t len = sizeof(err);
             if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) ok = true;
             else *outErrno = err;
         } else {
-            *outErrno = ETIMEDOUT;
+            *outErrno = nxc::host::operationCancelled() ? ECANCELED : ETIMEDOUT;
         }
     } else {
         *outErrno = errno;   // 通常是 ECONNREFUSED：立刻就知道没人听

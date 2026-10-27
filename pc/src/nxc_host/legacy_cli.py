@@ -15,11 +15,11 @@
            ERR <码> <说明>\\n
 
 用法：
-    python3 pc/nxc.py hello
-    python3 pc/nxc.py caps
-    python3 pc/nxc.py help tool=probe
-    python3 pc/nxc.py 'probe.list' 'probe.group n=1'
-    echo 'identify.id' | python3 pc/nxc.py -          # 从 stdin 读命令
+    PYTHONPATH=pc/src python3 -m nxc_host.legacy_cli hello
+    PYTHONPATH=pc/src python3 -m nxc_host.legacy_cli caps
+    PYTHONPATH=pc/src python3 -m nxc_host.legacy_cli help tool=probe
+    PYTHONPATH=pc/src python3 -m nxc_host.legacy_cli 'probe.list' 'probe.group n=1'
+    echo 'identify.id' | PYTHONPATH=pc/src python3 -m nxc_host.legacy_cli -          # 从 stdin 读命令
 
 选项：
     --ip / --port        设备地址与端口（默认取环境变量 NXC_DEVICE_IP，未设置时为 192.168.1.50:47800）
@@ -28,7 +28,7 @@
 
 值的写法：**写自然值**，脚本负责把协议承载不了的字节转义（空格 → %20）。
 含空格的值请用引号：
-    python3 pc/nxc.py 'fs.ls path="/atmosphere/.../visible tinted rocks_3002235272"'
+    PYTHONPATH=pc/src python3 -m nxc_host.legacy_cli 'fs.ls path="/atmosphere/.../visible tinted rocks_3002235272"'
 `%` 是协议字符，本脚本**原样透传** —— 想表达字面的 `%` 请写 `%25`。
 """
 
@@ -38,49 +38,23 @@ import argparse
 import json
 import os
 import shlex
-import socket
 import sys
+
+from . import device as transport
 
 
 def run(ip: str, port: int, commands: list[str], timeout: float) -> list[dict]:
-    """发一批命令，返回每条命令的解析结果。"""
-    results: list[dict] = []
-    with socket.create_connection((ip, port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        stream = sock.makefile("rb")
-        for cmd in commands:
-            sock.sendall((cmd + "\n").encode())
-            header = stream.readline().decode("utf-8", "replace").rstrip("\n")
-            entry: dict = {"command": cmd, "header": header}
-
-            if header.startswith("OK "):
-                count = int(header.split()[1])
-                lines: list[str] = []
-                for _ in range(count):
-                    lines.append(stream.readline().decode("utf-8", "replace").rstrip("\n"))
-                entry["lines"] = lines
-            elif header.startswith("ERR "):
-                parts = header.split(" ", 2)
-                entry["error"] = {"code": int(parts[1]), "message": parts[2] if len(parts) > 2 else ""}
-            else:
-                entry["error"] = {"code": -1, "message": f"无法识别的响应头: {header!r}"}
-            results.append(entry)
-    return results
-
-
-import re
-
-# 设备侧对值里的「空格 / % / 控制字符」做了最小转义（%20 / %25 / %XX），
-# 因为 k=v 之间是用空格分列的。这里解回来。
-_PCT_ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
+    """复用 MCP 的完整帧校验；原始命令默认不重放，异常不返回半批结果。"""
+    device = transport.Device(ip, port, timeout)
+    try:
+        return device.call(commands)
+    finally:
+        device.close()
 
 
 def unescape_value(text: str) -> str:
-    """把设备侧转义过的值还原。被转义的只有 ASCII（空格/%/控制字符），
-    中文等多字节 UTF-8 不参与转义，所以逐字节还原即可。"""
-    if "%" not in text:
-        return text
-    return _PCT_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
+    """复用设备响应转义规则，保留既有 CLI 函数接口。"""
+    return transport.unescape_value(text)
 
 
 def escape_value(text: str) -> str:
@@ -90,10 +64,8 @@ def escape_value(text: str) -> str:
       `%` **原样透传**（所以"手写的 `%20`"仍然表示空格，老习惯不受影响；
       想表达字面的 `%` 就写 `%25`，和 URL 一样）。其余字符一个都不动。
     """
-    if not any(ch == " " or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
-        return text
-    return "".join("%%%02X" % ord(ch) if (ch == " " or ord(ch) < 0x20 or ord(ch) == 0x7F) else ch
-                   for ch in text)
+    # 复用值编码，但 CLI 是手写协议入口，继续保留已有的百分号转义。
+    return "%".join(transport.escape_value(part) for part in text.split("%"))
 
 
 def encode_command(line: str) -> str:
@@ -102,7 +74,7 @@ def encode_command(line: str) -> str:
     ★ 为什么放在客户端：协议用空格分列字段，所以值里的空格必须先转义。
       这样你就能直接写自然路径 —— 含空格的值请用引号（shell 那套写法）：
 
-          python3 pc/nxc.py 'fs.ls path="/atmosphere/.../visible tinted rocks_3002235272"'
+          PYTHONPATH=pc/src python3 -m nxc_host.legacy_cli 'fs.ls path="/atmosphere/.../visible tinted rocks_3002235272"'
 
       （不加引号会被本函数切成两段：`path=/…/visible` + 两个位置参数。）
     ★ 没有 `=` 的词（位置参数）原样保留 —— 它们本来就不是 `k=v`。
@@ -122,19 +94,7 @@ def encode_command(line: str) -> str:
 
 def to_structured(lines: list[str]) -> list:
     """把载荷行转成结构：'k=v k2=v2' → dict；'#文本' → str。"""
-    out = []
-    for line in lines:
-        if line.startswith("#"):
-            out.append(line[1:])
-            continue
-        record = {}
-        for field in line.split(" "):
-            if not field:
-                continue
-            key, _, value = field.partition("=")
-            record[key] = unescape_value(value)
-        out.append(record)
-    return out
+    return transport.parse_payload(lines)
 
 
 def main() -> int:
@@ -159,8 +119,8 @@ def main() -> int:
 
     try:
         results = run(args.ip, args.port, commands, args.timeout)
-    except OSError as exc:
-        print(f"连接失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+    except (OSError, RuntimeError) as exc:
+        print(f"通信失败：{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
     if args.json:

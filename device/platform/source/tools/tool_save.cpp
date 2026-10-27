@@ -1,515 +1,925 @@
-// ================================================================
-// NxCourier · Copyright (C) 2026 granule256
-//
-// 本文件是 NxCourier 的一部分，以 GNU 通用公共许可证第 2 版
-//（GPL-2.0-only）发布，不带任何担保。
-// 完整条款见仓库根目录的 LICENSE。
-// ================================================================
-
-// 内置工具 · save：**存档的枚举与备份**。
-//
-// ## 为什么需要它
-//
-// `mem.write` 能直接改运行中游戏的内存 —— 改错了游戏进度就毁了，
-// 而且**存档是"改内存"的下游**：改完往往要存档才生效，那时候已经没有后悔药。
-// 所以备份是改内存的**安全前提**。
-//
-// ## 两个能力
-//
-// * `save.list`   —— 枚举存档（哪个 title、哪个用户、多大、在哪个空间）
-// * `save.backup` —— 把某个 title 的存档**整个目录树**复制到 SD 卡上。
-//
-// ## 实现要点（libnx 接口）
-//
-// 枚举：
-//     fsOpenSaveDataInfoReader(&reader, space)
-//     fsSaveDataInfoReaderRead(&reader, buf, n, &total)   // 循环读
-//     fsSaveDataInfoReaderClose(&reader)
-// 挂载某个存档（挂上后就像个普通文件系统）：
-//     fsOpenSaveDataFileSystem(&fs, space, &FsSaveDataAttribute{
-//         application_id, uid, save_data_type, save_data_rank, save_data_index })
-// 遍历/读取（注意根路径是 "/"）：
-//     fsFsOpenDirectory / fsDirRead / fsDirClose
-//     fsFsOpenFile / fsFileGetSize / fsFileRead / fsFileClose
-//     fsFsClose
-//
-// ★ `fs` 服务在 main.cpp 里已经初始化过了（`fsInitialize()` + `fsdevMountSdmc()`），
-//   这里不用重复初始化。
-// ★ 大缓冲全部放静态（栈只有 64KB），别放栈上。
-// ★ 只做**只读地把设备上的存档复制出来**；恢复（写回）风险高，先不做。
+// NxCourier · Copyright (C) 2026 granule256 · GPL-2.0-only
+// 存档备份以 manifest.nxc + data/ + 最后写入的 COMPLETE 构成完整快照。
+// 固定缓冲、串行执行；恢复先完整校验，再清理/复制/提交，失败绝不回成功。
 #include "nxc_sdk.hpp"
 #include "../core/sd.hpp"
-
-#include <dirent.h>
 #include <switch.h>
+#include <dirent.h>
 #include <sys/stat.h>
-
 #include <cerrno>
-#include <cstdarg>
+#include <climits>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 namespace {
-
-constexpr const char* kBackupRoot = "/config/nxc/saves";
-constexpr int kCopyBuf   = 32768;   // 拷贝缓冲
-constexpr int kDirBatch  = 24;      // 一次读多少目录项
-constexpr int kInfoBatch = 32;      // 一次读多少存档信息
-constexpr int kMaxDepth  = 8;
-
-// ---- 静态缓冲
-FsDirectoryEntry g_entries[kDirBatch];
-FsSaveDataInfo   g_infos[kInfoBatch];
-unsigned char    g_copy[kCopyBuf];
-
-struct CopyStat {
-    int files;
-    int dirs;
-    int failed;
+#ifndef NXC_SAVE_BACKUP_ROOT
+#define NXC_SAVE_BACKUP_ROOT "/config/nxc/saves"
+#endif
+const char* const kBackupRoot = NXC_SAVE_BACKUP_ROOT;
+constexpr size_t kPath = 1536;
+constexpr int kMaxDepth = 16;
+constexpr int kMaxEntries = 4096;
+unsigned char g_copy[32768];
+unsigned char g_pathHashes[kMaxEntries][32];
+bool g_pathDirectories[kMaxEntries];
+char g_line[FS_MAX_PATH * 2 + 256];
+char g_hexPath[FS_MAX_PATH * 2 + 1];
+FsSaveDataInfo g_infos[32];
+struct Stats {
     long long bytes;
-    // ★★★ 2026-10-06 晚新增：**第一条**失败原因。
-    //   动机是一次真实的"最坏失败形态"：`save.backup` 回了
-    //   `OK … files=0 dirs=1 bytes=0 failed=4 result=partial`，而目标目录**根本不存在**
-    //   ⇒ 零产出、却长得像成功。只报个计数没用，得把**根因那句话**带出来。
-    //   只记第一条：第一条才是根因，后面的多半是它的连锁反应。
-    char firstErr[96];
+    int files, dirs, entries;
 };
-CopyStat g_stat;
+struct ManifestEntry {
+    char path[FS_MAX_PATH];
+    char hash[65];
+    long long size;
+    bool dir;
+};
 
-void setFirstErr(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-void setFirstErr(const char* fmt, ...) {
-    if (g_stat.firstErr[0] != '\0') return;
-    va_list ap;
-    va_start(ap, fmt);
-    std::vsnprintf(g_stat.firstErr, sizeof(g_stat.firstErr), fmt, ap);
-    va_end(ap);
+bool cancelled(nxc::Reply& r) {
+    if (!nxc::host::operationCancelled()) return false;
+    r.fail(499, "operation-cancelled: 备份不完整或恢复未提交，请保留原备份并检查目标");
+    return true;
 }
 
-// 逐级建目录（等价 `mkdir -p`），已存在也算成功。
-//
-// ★★★ 2026-10-06 晚新增 —— `save.backup` **零产出却回 OK** 的根因就在这。
-//   `copyTree()` 只对**最末一级**做一次 `::mkdir`，而父目录 `/config/nxc/saves`
-//   **全代码库没有任何地方创建过** ⇒ mkdir 返回 ENOENT、**返回值还被丢掉了**，
-//   于是后面每个文件的 `fopen("wb")` 都因"目标路径不存在"失败，最后回一个 `partial`。
-//   路径必须是绝对路径（本平台只做 SD 卡，挂载点是固定的）。
-bool ensureDirChain(const char* path) {
-    if (path == nullptr || path[0] != '/') return false;
-    const size_t len = std::strlen(path);
-    char buf[512];
-    if (len == 0 || len >= sizeof(buf)) return false;
-    std::memcpy(buf, path, len + 1);
+bool join(const char* base, const char* path, char* out, size_t cap) {
+    int n = std::snprintf(out, cap, "%s%s%s", base, (*path == '/' ? "" : "/"), path);
+    return n > 0 && static_cast<size_t>(n) < cap;
+}
 
-    for (size_t i = 1; i <= len; ++i) {
-        if (buf[i] != '/' && buf[i] != '\0') continue;
-        const char keep = buf[i];
-        buf[i] = '\0';
-        const int rc = ::mkdir(buf, 0755);
-        const bool ok = (rc == 0) || (errno == EEXIST);
-        buf[i] = keep;
-        if (!ok) return false;
+bool validPath(const char* path, bool relativeToSave = false) {
+    if (!path || path[0] != '/' || std::strchr(path, ':') || std::strlen(path) >= (relativeToSave ? FS_MAX_PATH : kPath)) return false;
+    if (std::strcmp(path,"/")==0) return relativeToSave;
+    const char* p = path+1;
+    while (*p) {
+        const char* end = std::strchr(p,'/');
+        size_t n = end ? static_cast<size_t>(end-p) : std::strlen(p);
+        if (!n || (n==1 && p[0]=='.') || (n==2 && p[0]=='.' && p[1]=='.')) return false;
+        if (!end) return true;
+        p=end+1;
+        if (!*p) return false;
+    }
+    return false;
+}
+
+bool backupPath(const char* path) {
+    if (!validPath(path)) return false;
+    size_t n=std::strlen(kBackupRoot);
+    return std::strncmp(path,kBackupRoot,n)==0 && path[n]=='/' && path[n+1];
+}
+// EEXIST 只有确实是目录才通过；禁止宿主上的符号链接重定向备份路径。
+
+bool ensureDirs(const char* path) {
+    char tmp[kPath];
+    if (!validPath(path)) return false;
+    std::strcpy(tmp,path);
+    size_t n=std::strlen(tmp);
+    for(size_t i=1;i<=n;++i) if(tmp[i]=='/' || !tmp[i]) {
+        char keep=tmp[i];
+        tmp[i]=0;
+        struct stat st{};
+        bool ok=(::mkdir(tmp,0755)==0) || (errno==EEXIST && ::lstat(tmp,&st)==0 && S_ISDIR(st.st_mode));
+        tmp[i]=keep;
+        if(!ok)return false;
     }
     return true;
 }
 
-bool parseSpace(const char* name, FsSaveDataSpaceId* out) {
-    if (name == nullptr || *name == '\0') { *out = FsSaveDataSpaceId_User; return true; }
-    if (std::strcmp(name, "user") == 0)     { *out = FsSaveDataSpaceId_User; return true; }
-    if (std::strcmp(name, "system") == 0)   { *out = FsSaveDataSpaceId_System; return true; }
-    if (std::strcmp(name, "sduser") == 0)   { *out = FsSaveDataSpaceId_SdUser; return true; }
-    if (std::strcmp(name, "sdsystem") == 0) { *out = FsSaveDataSpaceId_SdSystem; return true; }
-    if (std::strcmp(name, "all") == 0)      { *out = FsSaveDataSpaceId_All; return true; }
+bool regular(const char* p, bool dir=false) {
+    struct stat s{};
+    return ::lstat(p,&s)==0 && (dir?S_ISDIR(s.st_mode):S_ISREG(s.st_mode));
+}
+
+void hashText(const unsigned char* digest, char* text) {
+    static const char hex[]="0123456789abcdef";
+    for(int i=0;i<32;++i) {
+        text[2*i]=hex[digest[i]>>4];
+        text[2*i+1]=hex[digest[i]&15];
+    }
+    text[64]=0;
+}
+
+void finishHash(Sha256Context& c,char* text) {
+    unsigned char d[32];
+    sha256ContextGetHash(&c,d);
+    hashText(d,text);
+}
+
+bool hashFile(const char* path,char* hash,long long* bytes,nxc::Reply& r) {
+    if(!regular(path))return false;
+    FILE* f=nxc::sd::open(path,"rb");
+    if(!f)return false;
+    Sha256Context c;
+    sha256ContextCreate(&c);
+    *bytes=0;
+    bool ok=true;
+    for(;;) {
+        if(cancelled(r)) {
+            ok=false;
+            break;
+        }
+        size_t n=std::fread(g_copy,1,sizeof(g_copy),f);
+        if(n) {
+            sha256ContextUpdate(&c,g_copy,n);
+            *bytes+=static_cast<long long>(n);
+        }
+        if(n<sizeof(g_copy)) {
+            if(std::ferror(f))ok=false;
+            break;
+        }
+    }
+    if(std::fclose(f)!=0)ok=false;
+    if(ok)finishHash(c,hash);
+    return ok;
+}
+
+bool closeOutput(FILE* f) {
+    bool ok=std::fflush(f)==0;
+    if(std::fclose(f)!=0)ok=false;
+    return ok;
+}
+
+bool parseSpace(const char* name,FsSaveDataSpaceId* out) {
+    if(!name||!strcmp(name,"user")) {
+        *out=FsSaveDataSpaceId_User;
+        return true;
+    }
+    if(!strcmp(name,"system")) {
+        *out=FsSaveDataSpaceId_System;
+        return true;
+    }
+    if(!strcmp(name,"sduser")) {
+        *out=FsSaveDataSpaceId_SdUser;
+        return true;
+    }
+    if(!strcmp(name,"sdsystem")) {
+        *out=FsSaveDataSpaceId_SdSystem;
+        return true;
+    }
+    if(!strcmp(name,"all")) {
+        *out=FsSaveDataSpaceId_All;
+        return true;
+    }
     return false;
 }
 
-// 把挂载点内的路径拼出来。挂载后的根是 "/"，别拼成 "//x"。
-// ★ 返回 false 表示**被截断了** —— 调用方必须放弃这个文件。
-//   对复制工具来说，路径被悄悄截断就等于"复制了另一个文件"，比报错危险得多。
-bool joinFsPath(const char* base, const char* name, char* out, size_t cap) {
-    int n = 0;
-    if (std::strcmp(base, "/") == 0) n = std::snprintf(out, cap, "/%s", name);
-    else                             n = std::snprintf(out, cap, "%s/%s", base, name);
-    return n > 0 && static_cast<size_t>(n) < cap;
+bool parseUid(const char* text,AccountUid* uid) {
+    if(!text||strlen(text)!=32)return false;
+    u64 v[2]={};
+    for(int i=0;i<32;++i) {
+        int d=nxc::codec::hexDigit(text[i]);
+        if(d<0)return false;
+        v[i/16]=(v[i/16]<<4)|static_cast<unsigned>(d);
+    }
+    uid->uid[1]=v[0];
+    uid->uid[0]=v[1];
+    return true;
 }
 
-bool joinSdPath(const char* base, const char* name, char* out, size_t cap) {
-    const int n = std::snprintf(out, cap, "%s/%s", base, name);
-    return n > 0 && static_cast<size_t>(n) < cap;
-}
-
-// 在指定空间里找某个 title 的存档。找到第一个就返回。
-bool findSave(FsSaveDataSpaceId space, u64 appId, FsSaveDataInfo* out) {
-    FsSaveDataInfoReader reader;
-    if (R_FAILED(fsOpenSaveDataInfoReader(&reader, space))) return false;
-
-    bool found = false;
-    for (;;) {
-        s64 total = 0;
-        if (R_FAILED(fsSaveDataInfoReaderRead(&reader, g_infos, kInfoBatch, &total))) break;
-        if (total <= 0) break;
-        for (s64 i = 0; i < total; ++i) {
-            if (g_infos[i].application_id == appId) { *out = g_infos[i]; found = true; break; }
+bool selectSave(const nxc::Args& a,FsSaveDataInfo* out,nxc::Reply& r) {
+    u64 app=0,id=0;
+    AccountUid uid{};
+    const bool hasId=a.has("save_id"),hasUid=a.has("uid");
+    if(!nxc::util::parseU64(a.get("app"),&app)||!app) {
+        r.fail(400,"app-required: 使用save.list输出的app");
+        return false;
+    }
+    if((hasId&&(!nxc::util::parseU64(a.get("save_id"),&id)||!id)) || (hasUid&&!parseUid(a.get("uid"),&uid))) {
+        r.fail(400,"save_id/uid-invalid");
+        return false;
+    }
+    FsSaveDataSpaceId requested=FsSaveDataSpaceId_All;
+    if(a.has("space")&&!parseSpace(a.get("space"),&requested)) {
+        r.fail(400,"space-invalid");
+        return false;
+    }
+    const FsSaveDataSpaceId spaces[]= {
+        FsSaveDataSpaceId_User,FsSaveDataSpaceId_SdUser,FsSaveDataSpaceId_System,FsSaveDataSpaceId_SdSystem
+    };
+    int found=0;
+    for(auto sp:spaces) {
+        if(requested!=FsSaveDataSpaceId_All&&requested!=sp)continue;
+        FsSaveDataInfoReader rd;
+        if(R_FAILED(fsOpenSaveDataInfoReader(&rd,sp))) {
+            r.fail(500,"open-info-reader-failed");
+            return false;
         }
-        if (found) break;
-        if (total < kInfoBatch) break;   // 已经是最后一批
-    }
-    fsSaveDataInfoReaderClose(&reader);
-    return found;
-}
-
-// 把一个存档里的文件复制到 SD。
-void copyOneFile(FsFileSystem* fs, const char* src, const char* dst) {
-    FsFile f;
-    if (R_FAILED(fsFsOpenFile(fs, src, FsOpenMode_Read, &f))) {
-        setFirstErr("open-src %s", src);
-        ++g_stat.failed;
-        return;
-    }
-
-    s64 size = 0;
-    fsFileGetSize(&f, &size);
-
-    FILE* out = nxc::sd::open(dst, "wb");
-    if (out == nullptr) {
-        nxc::host::log("save: 打不开目标 %s", dst);
-        setFirstErr("open-dst %s", dst);      // ★ 这条就是原来那个"零产出"的答案
-        fsFileClose(&f);
-        ++g_stat.failed;
-        return;
-    }
-
-    s64 off = 0;
-    bool ok = true;
-    while (off < size) {
-        const s64 want = (size - off < kCopyBuf) ? (size - off) : kCopyBuf;
-        u64 got = 0;
-        if (R_FAILED(fsFileRead(&f, off, g_copy, static_cast<u64>(want), 0, &got)) || got == 0) {
-            ok = false;
-            break;
-        }
-        if (std::fwrite(g_copy, 1, static_cast<size_t>(got), out) != static_cast<size_t>(got)) {
-            ok = false;
-            break;
-        }
-        off += static_cast<s64>(got);
-    }
-    std::fclose(out);
-    fsFileClose(&f);
-
-    if (ok) { ++g_stat.files; g_stat.bytes += size; }
-    else    {
-        ++g_stat.failed;
-        setFirstErr("copy-body %s", src);
-        nxc::host::log("save: 复制失败 %s", src);
-    }
-}
-
-// 递归复制整个目录。
-void copyTree(FsFileSystem* fs, const char* fsPath, const char* sdPath, int depth) {
-    if (depth > kMaxDepth) return;
-
-    // ★★★ 2026-10-06 晚：`dirs` 原来**无条件 ++**，于是"一个目录都没建成"也会报 `dirs=1`
-    //   —— 实测那次 `files=0 dirs=1 bytes=0 failed=4` 里的 `dirs=1` 就是这么来的，
-    //   它把读的人往"目录建好了、只是文件没复制成"的方向带偏。
-    //   现在：**只有真的建成、或本来就存在，才计数**；建不出来就当场记失败并放弃这一棵子树。
-    const int mk = ::mkdir(sdPath, 0755);
-    if (mk != 0 && errno != EEXIST) {
-        ++g_stat.failed;
-        setFirstErr("mkdir %s rc=%d", sdPath, mk);
-        nxc::host::log("save: 建目录失败 %s rc=%d", sdPath, mk);
-        return;
-    }
-    ++g_stat.dirs;
-
-    FsDir dir;
-    if (R_FAILED(fsFsOpenDirectory(fs, fsPath,
-                                   FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles, &dir))) {
-        nxc::host::log("save: 打不开目录 %s", fsPath);
-        return;
-    }
-
-    for (;;) {
-        s64 total = 0;
-        if (R_FAILED(fsDirRead(&dir, &total, kDirBatch, g_entries))) break;
-        if (total <= 0) break;
-
-        for (s64 i = 0; i < total; ++i) {
-            const char* name = g_entries[i].name;
-            char childFs[FS_MAX_PATH];
-            char childSd[FS_MAX_PATH + 256];
-            const bool okFs = joinFsPath(fsPath, name, childFs, sizeof(childFs));
-            const bool okSd = joinSdPath(sdPath, name, childSd, sizeof(childSd));
-            if (!okFs || !okSd) {
-                // 路径太长被截断了 —— 宁可记一笔失败，也不要静默复制错文件。
-                ++g_stat.failed;
-                setFirstErr("path-too-long %.40s", name);
-                nxc::host::log("save: 路径过长，跳过 %.40s", name);
-                continue;
+        bool ok=true;
+        for(;;) {
+            if(cancelled(r)) {
+                ok=false;
+                break;
             }
-
-            if (g_entries[i].type == FsDirEntryType_Dir) {
-                copyTree(fs, childFs, childSd, depth + 1);
-            } else if (g_entries[i].type == FsDirEntryType_File) {
-                copyOneFile(fs, childFs, childSd);
+            s64 count=0;
+            if(R_FAILED(fsSaveDataInfoReaderRead(&rd,g_infos,32,&count))||count<0||count>32) {
+                ok=false;
+                break;
+            }
+            if(!count)break;
+            for(s64 i=0;i<count;++i) {
+                auto& x=g_infos[i];
+                if(x.application_id!=app||(hasId&&x.save_data_id!=id)||(hasUid&&(x.uid.uid[0]!=uid.uid[0]||x.uid.uid[1]!=uid.uid[1])))continue;
+                *out=x;
+                ++found;
             }
         }
-        if (total < kDirBatch) break;
+        fsSaveDataInfoReaderClose(&rd);
+        if(!ok) {
+            if(!r.hasError())r.fail(500,"read-info-failed");
+            return false;
+        }
     }
-    fsDirClose(&dir);
+    if(found!=1) {
+        r.fail(found?409:404,found?"ambiguous-save: 用uid/save_id/space明确选择一份存档":"save-not-found");
+        return false;
+    }
+    return true;
 }
 
-void emitInfo(nxc::Reply& r, const FsSaveDataInfo& info) {
+FsSaveDataAttribute attribute(const FsSaveDataInfo& i) {
+    FsSaveDataAttribute a{};
+    a.application_id=i.application_id;
+    a.uid=i.uid;
+    a.system_save_data_id=i.system_save_data_id;
+    a.save_data_type=i.save_data_type;
+    a.save_data_rank=i.save_data_rank;
+    a.save_data_index=i.save_data_index;
+    return a;
+}
+
+void emitInfo(nxc::Reply& r,const FsSaveDataInfo& i) {
     r.next();
-    r.kvf("app", "0x%016llX", static_cast<unsigned long long>(info.application_id));
-    r.kvf("save_id", "0x%016llX", static_cast<unsigned long long>(info.save_data_id));
-    r.kvi("space", info.save_data_space_id);
-    r.kvi("type", info.save_data_type);
-    r.kvi("size", static_cast<long long>(info.size));
-    r.kvf("uid", "%016llX%016llX",
-          static_cast<unsigned long long>(info.uid.uid[1]),
-          static_cast<unsigned long long>(info.uid.uid[0]));
+    r.kvf("app","0x%016llX",(unsigned long long)i.application_id);
+    r.kvf("save_id","0x%016llX",(unsigned long long)i.save_data_id);
+    r.kvf("uid","%016llX%016llX",(unsigned long long)i.uid.uid[1],(unsigned long long)i.uid.uid[0]);
+    r.kvi("space",i.save_data_space_id);
+    r.kvi("type",i.save_data_type);
+    r.kvi("size",i.size);
 }
 
-// ---------------------------------------------------------------- 方法
 void cmdList(const nxc::Args& a, nxc::Reply& r) {
-    FsSaveDataSpaceId space = FsSaveDataSpaceId_User;
-    if (!parseSpace(a.get("space"), &space)) { r.fail(400, "space-invalid"); return; }
-
-    long long want = a.getInt("count", 20);
-    // ★★★ 2026-10-06 晚：越界值仍回落默认 20，但**不再静默**（见函数尾部 note_params）。
-    bool wantAdjusted = false;
-    if (want <= 0 || want > 200) { want = 20; wantAdjusted = true; }
-
-    // ★★★ 2026-10-06 晚：`app` 过滤改用 `util::parseU64`，并且**解析不出来就报错**。
-    //   原来用 `getInt` ⇒ `app=0x…` 被读成 0，而 0 在下面的判断里是"**不过滤**"
-    //   ⇒ 它把**全部存档**列了出来。看起来"参数生效了"，其实过滤条件被静默丢掉了 ——
-    //   所以 `save.list app=` 这个功能**从来没有工作过**（报告里"save.list 能接受 0x"是假象）。
-    u64 filterApp = 0;
-    const char* filterText = a.get("app");
-    if (filterText != nullptr && *filterText != '\0') {
-        if (!nxc::util::parseU64(filterText, &filterApp) || filterApp == 0) {
-            r.failf(400, "bad-app: 解析不出 title id: %.64s", filterText);
-            return;
-        }
-    }
-
-    FsSaveDataInfoReader reader;
-    const Result rc = fsOpenSaveDataInfoReader(&reader, space);
-    if (R_FAILED(rc)) {
-        r.failf(500, "open-info-reader-failed rc=0x%08X", static_cast<unsigned>(rc));
+    FsSaveDataSpaceId space;
+    if (!parseSpace(a.get("space"), &space)) {
+        r.fail(400, "space-invalid");
         return;
     }
-
+    const long long limit = a.getInt("count", 20);
+    const long long offset = a.getInt("offset", 0);
+    if (limit < 1 || limit > 200 || offset < 0) {
+        r.fail(400, "pagination-invalid: offset>=0 count=1..200");
+        return;
+    }
+    u64 app = 0;
+    if (a.has("app") && (!nxc::util::parseU64(a.get("app"), &app) || !app)) {
+        r.fail(400, "app-invalid");
+        return;
+    }
+    FsSaveDataInfoReader reader;
+    if (R_FAILED(fsOpenSaveDataInfoReader(&reader, space))) {
+        r.fail(500, "open-info-reader-failed");
+        return;
+    }
     int emitted = 0;
-    long long seen = 0;
-    for (;;) {
-        s64 total = 0;
-        if (R_FAILED(fsSaveDataInfoReaderRead(&reader, g_infos, kInfoBatch, &total))) break;
-        if (total <= 0) break;
-        for (s64 i = 0; i < total && emitted < want; ++i) {
-            ++seen;
-            if (filterApp != 0 && g_infos[i].application_id != filterApp) continue;
+    long long matched = 0;
+    bool ok = true, truncated = false;
+    while (!truncated) {
+        if (cancelled(r)) {
+            ok = false;
+            break;
+        }
+        s64 count = 0;
+        if (R_FAILED(fsSaveDataInfoReaderRead(&reader, g_infos, 32, &count)) || count < 0 || count > 32) {
+            ok = false;
+            break;
+        }
+        if (!count) break;
+        for (s64 i = 0; i < count; ++i) {
+            if (app && g_infos[i].application_id != app) continue;
+            if (matched++ < offset) continue;
+            if (emitted >= limit) {
+                truncated = true;
+                break;
+            }
             emitInfo(r, g_infos[i]);
             ++emitted;
         }
-        if (total < kInfoBatch) break;
-        if (emitted >= want) break;
     }
     fsSaveDataInfoReaderClose(&reader);
-
+    if (!ok) {
+        if (!r.hasError()) r.fail(500, "read-info-failed");
+        return;
+    }
     r.next();
     r.kvi("count", emitted);
-    r.kvi("scanned", seen);
-    r.raw("note: space = user(默认) | system | sduser | sdsystem | all");
-    r.raw("note: 用 save.backup app=<app 里的 0x...> 把某个存档整棵目录树备份到 SD");
-    if (wantAdjusted) {
-        r.next();   // ★ 先收尾上一行（raw 行末尾没有换行），否则提示会拼到上一条 note 后面
-        r.kv("note_params", "count 越界（允许 1..200），已按默认 20 执行");
-    }
+    r.kvi("offset", offset);
+    r.kvi("next_offset", truncated ? offset + emitted : -1);
+    r.kvi("truncated", truncated ? 1 : 0);
 }
 
-void cmdBackup(const nxc::Args& a, nxc::Reply& r) {
-    const char* appText = a.get("app");
-    u64 appId = 0;
-    // ★★★ 2026-10-06 晚：这里改用 `util::parseU64`（认 `0x`），**不再用 `getInt`**。
-    //   `save.list` 打印 title id 用的就是 `0x%016llX`，而 `getInt` 只认十进制 ⇒
-    //   会把 `0x010015100B514000` 读成 0，撞进下面的 `appArg == 0` 分支报 `missing-app`
-    //   —— **工具自己打印的格式，工具自己读不进去**（实测就是这么翻的车）。
-    if (appText == nullptr || *appText == '\0') {
-        // ★ 提示语折进错误消息里：`fail()` 走 ERR 分支时，**之前 raw 写的提示会被丢掉**
-        //   （协议里 ERR 不带载荷）。原来那句 `hint:` 从来没到达过客户端。
-        r.fail(400, "missing-app: 需要 app=<title id，如 0x010021C000B6A000>（可用 save.list 查看）");
+// 路径用十六进制编码，空格、换行、UTF-8 文件名不会破坏清单格式。
+
+bool writeEntry(FILE* manifest,const char* path,bool dir,long long size,const char* hash,Stats& s) {
+    if(++s.entries>kMaxEntries||!validPath(path,true))return false;
+    const size_t n=strlen(path);
+    static const char hex[]="0123456789abcdef";
+    for(size_t i=0;i<n;++i) {
+        unsigned char c=path[i];
+        g_hexPath[2*i]=hex[c>>4];
+        g_hexPath[2*i+1]=hex[c&15];
+    }
+    g_hexPath[2*n]=0;
+    return std::fprintf(manifest,"%c %lld %s %s\n",dir?'D':'F',size,dir?"-":hash,g_hexPath)>0;
+}
+
+bool copyFileOut(FsFileSystem* fs,const char* path,const char* data,FILE* manifest,Stats& s,nxc::Reply& r) {
+    FsFile in;
+    if(R_FAILED(fsFsOpenFile(fs,path,FsOpenMode_Read,&in)))return false;
+    s64 size=0;
+    bool ok=R_SUCCEEDED(fsFileGetSize(&in,&size))&&size>=0;
+    char dest[kPath];
+    if(!join(data,path,dest,sizeof(dest)))ok=false;
+    FILE* out=ok?nxc::sd::open(dest,"wb"):nullptr;
+    if(!out)ok=false;
+    Sha256Context hash;
+    sha256ContextCreate(&hash);
+    s64 off=0;
+    while(ok&&off<size) {
+        if(cancelled(r)) {
+            ok=false;
+            break;
+        }
+        u64 want=static_cast<u64>((size-off)<static_cast<s64>(sizeof(g_copy))?(size-off):sizeof(g_copy)),got=0;
+        if(R_FAILED(fsFileRead(&in,off,g_copy,want,0,&got))||!got||got>want) {
+            ok=false;
+            break;
+        }
+        sha256ContextUpdate(&hash,g_copy,got);
+        if(fwrite(g_copy,1,got,out)!=got) {
+            ok=false;
+            break;
+        }
+        off+=got;
+    }
+    if(out&&!closeOutput(out))ok=false;
+    fsFileClose(&in);
+    char digest[65];
+    finishHash(hash,digest);
+    if(ok)ok=writeEntry(manifest,path,false,size,digest,s);
+    if(ok) {
+        ++s.files;
+        s.bytes+=size;
+    }
+    return ok;
+}
+
+bool backupTree(FsFileSystem* fs,const char* path,const char* data,FILE* manifest,Stats& s,nxc::Reply& r,int depth) {
+    if(depth>kMaxDepth||cancelled(r))return false;
+    char target[kPath];
+    if(!join(data,path,target,sizeof(target)))return false;
+    if(strcmp(path,"/")&&::mkdir(target,0755)!=0)return false;
+    if(!writeEntry(manifest,path,true,0,"-",s))return false;
+    ++s.dirs;
+    FsDir dir;
+    if(R_FAILED(fsFsOpenDirectory(fs,path,FsDirOpenMode_ReadDirs|FsDirOpenMode_ReadFiles,&dir)))return false;
+    bool ok=true;
+    for(;;) {
+        if(cancelled(r)) {
+            ok=false;
+            break;
+        }
+        FsDirectoryEntry e{};
+        s64 n=0;
+        if(R_FAILED(fsDirRead(&dir,&n,1,&e))||n<0||n>1) {
+            ok=false;
+            break;
+        }
+        if(!n)break;
+        if(!memchr(e.name,0,sizeof(e.name))||strchr(e.name,'/')||!strcmp(e.name,".")||!strcmp(e.name,"..")) {
+            ok=false;
+            break;
+        }
+        char child[FS_MAX_PATH];
+        int len=snprintf(child,sizeof(child),"%s%s%s",path,strcmp(path,"/")?"/":"",e.name);
+        if(len<0||size_t(len)>=sizeof(child)) {
+            ok=false;
+            break;
+        }
+        if(e.type==FsDirEntryType_Dir)ok=backupTree(fs,child,data,manifest,s,r,depth+1);
+        else if(e.type==FsDirEntryType_File)ok=copyFileOut(fs,child,data,manifest,s,r);
+        else ok=false;
+        if(!ok)break;
+    }
+    fsDirClose(&dir);
+    return ok;
+}
+
+bool writeHeader(FILE* f,const FsSaveDataInfo& i) {
+    return fprintf(f,"NXC_SAVE_V1 %016llX %016llX %016llX%016llX %u %u %u %u %016llX\n",(unsigned long long)i.application_id,(unsigned long long)i.save_data_id,(unsigned long long)i.uid.uid[1],(unsigned long long)i.uid.uid[0],unsigned(i.save_data_space_id),unsigned(i.save_data_type),unsigned(i.save_data_rank),unsigned(i.save_data_index),(unsigned long long)i.system_save_data_id)>0;
+}
+
+bool appStopped(u64 app, nxc::Reply& r);
+
+void cmdBackup(const nxc::Args& a,nxc::Reply& r) {
+    FsSaveDataInfo info{};
+    if(!selectSave(a,&info,r))return;
+    if (!appStopped(info.application_id, r)) return;
+    char root[kPath];
+    const char* to=a.get("to");
+    if(to) {
+        if(!backupPath(to)) {
+            r.fail(400,"to-must-be-new-directory-under-backup-root");
+            return;
+        }
+        strcpy(root,to);
+    }
+    else {
+        int n=snprintf(root,sizeof(root),"%s/%016llX-%016llX-%016llX-%016llX",kBackupRoot,(unsigned long long)info.application_id,(unsigned long long)info.save_data_id,(unsigned long long)info.uid.uid[0],(unsigned long long)armGetSystemTick());
+        if(n<0||size_t(n)>=sizeof(root)) {
+            r.fail(400,"path-too-long");
+            return;
+        }
+    }
+    char parent[kPath];
+    strcpy(parent,root);
+    *strrchr(parent,'/')=0;
+    if(!ensureDirs(parent)) {
+        r.fail(500,"backup-parent-unavailable");
         return;
     }
-    if (!nxc::util::parseU64(appText, &appId) || appId == 0) {
-        r.failf(400, "bad-app: 解析不出 title id: %.64s（形如 0x010021C000B6A000）", appText);
+    if(::mkdir(root,0755)!=0) {
+        r.fail(errno==EEXIST?409:500,"backup-directory-must-not-exist: 不覆盖已有备份");
         return;
     }
-
-    // 在几个空间里找。用户存档通常在 user；但 CFW 上也可能落在 sduser。
-    static const FsSaveDataSpaceId kSearch[] = {
-        FsSaveDataSpaceId_User, FsSaveDataSpaceId_SdUser,
-        FsSaveDataSpaceId_System, FsSaveDataSpaceId_SdSystem,
-    };
-    FsSaveDataInfo info;
-    bool found = false;
-    for (FsSaveDataSpaceId sp : kSearch) {
-        if (findSave(sp, appId, &info)) { found = true; break; }
-    }
-    if (!found) { r.fail(404, "no-save-for-that-app"); return; }
-
-    // 目标目录：默认 /config/nxc/saves/<app 的 16 位十六进制>
-    char dstRoot[512];
-    const char* to = a.get("to");
-    if (to != nullptr && *to != '\0') {
-        std::snprintf(dstRoot, sizeof(dstRoot), "%s", to);
-    } else {
-        std::snprintf(dstRoot, sizeof(dstRoot), "%s/%016llX", kBackupRoot,
-                      static_cast<unsigned long long>(appId));
-    }
-    if (std::strncmp(dstRoot, kBackupRoot, std::strlen(kBackupRoot)) != 0) {
-        r.fail(403, "to-must-be-under-/config/nxc/saves");
+    char data[kPath],manifest[kPath],complete[kPath];
+    if(!join(root,"data",data,sizeof(data))||!join(root,"manifest.nxc",manifest,sizeof(manifest))||!join(root,"COMPLETE",complete,sizeof(complete))||::mkdir(data,0755)!=0) {
+        r.fail(500,"create-backup-layout-failed");
         return;
     }
-
-    FsSaveDataAttribute attr;
-    std::memset(&attr, 0, sizeof(attr));
-    attr.application_id   = info.application_id;
-    attr.uid              = info.uid;
-    attr.save_data_type   = info.save_data_type;
-    attr.save_data_rank   = info.save_data_rank;
-    attr.save_data_index  = info.save_data_index;
-
     FsFileSystem fs;
-    const Result rc = fsOpenSaveDataFileSystem(&fs, static_cast<FsSaveDataSpaceId>(info.save_data_space_id), &attr);
-    if (R_FAILED(rc)) {
-        r.failf(500, "mount-failed rc=0x%08X", static_cast<unsigned>(rc));
+    auto attr=attribute(info);
+    if(R_FAILED(fsOpenReadOnlySaveDataFileSystem(&fs,static_cast<FsSaveDataSpaceId>(info.save_data_space_id),&attr))) {
+        r.fail(500,"mount-readonly-failed");
         return;
     }
-
-    // ★★★ 2026-10-06 晚：**先把父目录链建出来**。
-    //   原来这里直接 `copyTree()`，而 `copyTree` 只 mkdir 最末一级 ⇒ 因为
-    //   `/config/nxc/saves` 从没被创建过，一级都建不成 ⇒ 后面每个文件都写不进去
-    //   ⇒ 最后回 `OK … files=0 failed=4`（**零产出却回成功**，最坏的一种失败形态）。
-    if (!ensureDirChain(kBackupRoot)) {
-        fsFsClose(&fs);
-        r.failf(500, "backup-root-unavailable: 建不出 %s", kBackupRoot);
-        return;
-    }
-
-    nxc::host::breadcrumb("save.backup app=0x%llX -> %s",
-                          static_cast<unsigned long long>(appId), dstRoot);
-
-    g_stat = CopyStat{};
-    copyTree(&fs, "/", dstRoot, 0);
+    FILE* out=nxc::sd::open(manifest,"wb");
+    Stats s{};
+    bool ok=out&&writeHeader(out,info)&&backupTree(&fs,"/",data,out,s,r,0);
+    if(out&&!closeOutput(out))ok=false;
     fsFsClose(&fs);
-
-    // ★★★ 2026-10-06 晚：**一个文件都没复制出来 = 失败**，不再回"看起来成功"的 partial。
-    //   要求：调用方一眼就能判死，并且能看到**根因那句话**（firstErr）。
-    if (g_stat.files == 0) {
-        r.failf(500, "backup-produced-nothing files=0 dirs=%d failed=%d first=%.60s",
-                g_stat.dirs, g_stat.failed,
-                g_stat.firstErr[0] ? g_stat.firstErr : "(无)");
+    char digest[65];
+    long long size=0;
+    if(ok)ok=hashFile(manifest,digest,&size,r);
+    if(ok) {
+        FILE* mark=nxc::sd::open(complete,"wb");
+        ok=mark!=nullptr;
+        if(mark) {
+            if(fprintf(mark,"%s\n",digest)!=65)ok=false;
+            if(!closeOutput(mark))ok=false;
+        }
+        if(!ok)::remove(complete);
+    }
+    if(!ok) {
+        if(!r.hasError())r.fail(500,"backup-incomplete: 未生成有效完成标志，禁止恢复");
         return;
     }
+    emitInfo(r,info);
+    r.kv("to",root);
+    r.kvi("files",s.files);
+    r.kvi("dirs",s.dirs);
+    r.kvi("bytes",s.bytes);
+    r.kv("result","ok");
+}
+// 一行至多为 2*FS_MAX_PATH + 哈希；超长、截断、尾随字段均拒绝。
 
-    r.kvf("app", "0x%016llX", static_cast<unsigned long long>(appId));
-    r.kv("to", dstRoot);
-    r.kvi("files", g_stat.files);
-    r.kvi("dirs", g_stat.dirs);
-    r.kvi("bytes", g_stat.bytes);
-    r.kvi("failed", g_stat.failed);
-    r.kv("result", g_stat.failed == 0 ? "ok" : "partial");
-    if (g_stat.failed != 0) {
-        // ★ 把第一条原因也带出来 —— 只给个 `failed=4` 等于让人去猜（原来连猜的线索都没有）。
-        r.kv("first", g_stat.firstErr[0] ? g_stat.firstErr : "(未记录)");
-        r.raw("★ 有失败：上面 first= 是第一条原因；failed= 非 0 就别当成功");
-    }
-    r.raw("next: 用 fs.ls / fs.read 把备份取走；或让 PC 侧的取文件工具拉回本地");
+bool line(FILE* f) {
+    if(!fgets(g_line,sizeof(g_line),f))return false;
+    size_t n=strlen(g_line);
+    return n&&g_line[n-1]=='\n';
 }
 
-// ---------------------------------------------------------------- 自描述元数据（2026-10-06 晚）
-//
-// ★★ 规矩：**这个工具的全部知识都写在本文件里** —— 核心不认识 `save` 是什么，
-//    `tools.list` / `tools.doc` 只是把这里的内容汇总出去。**AI 就是靠这些字学会用它。**
-//    ⇒ 新增/改动方法时，把参数表与教程一起改（别只改实现）。
-namespace {
+// 只接受工具实际支持的空间；枚举值不连续，不能用 space<=某数 判断。
+bool supportedSaveSpace(u64 space) {
+    switch (space) {
+        case FsSaveDataSpaceId_User:
+        case FsSaveDataSpaceId_System:
+        case FsSaveDataSpaceId_SdUser:
+        case FsSaveDataSpaceId_SdSystem:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool supportedSaveType(u64 type) {
+    switch (type) {
+        case FsSaveDataType_System:
+        case FsSaveDataType_Account:
+        case FsSaveDataType_Bcat:
+        case FsSaveDataType_Device:
+        case FsSaveDataType_Temporary:
+        case FsSaveDataType_Cache:
+        case FsSaveDataType_SystemBcat:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool readHeader(FILE* f, FsSaveDataInfo& info) {
+    if (!line(f)) return false;
+    unsigned long long app, id, hi, lo, sys;
+    char spaceText[21], typeText[21], rankText[21], indexText[21];
+    u64 space = 0, type = 0, rank = 0, index = 0;
+    int end = 0;
+    const int fields = sscanf(g_line,
+        "NXC_SAVE_V1 %16llx %16llx %16llx%16llx %20s %20s %20s %20s %16llx%n",
+        &app, &id, &hi, &lo, spaceText, typeText, rankText, indexText, &sys, &end);
+    if (fields != 9 || strcmp(g_line + end, "\n") || !app || !id) return false;
+    // 先用有溢出检查的解析器读取，再检查真实枚举和 u16 边界，避免 scanf %u 截断。
+    if (!nxc::util::parseU64(spaceText, &space) || !supportedSaveSpace(space) ||
+        !nxc::util::parseU64(typeText, &type) || !supportedSaveType(type) ||
+        !nxc::util::parseU64(rankText, &rank) ||
+        (rank != FsSaveDataRank_Primary && rank != FsSaveDataRank_Secondary) ||
+        !nxc::util::parseU64(indexText, &index) || index > UINT16_MAX) return false;
+    info = {};
+    info.application_id = app;
+    info.save_data_id = id;
+    info.uid.uid[1] = hi;
+    info.uid.uid[0] = lo;
+    info.system_save_data_id = sys;
+    info.save_data_space_id = static_cast<u8>(space);
+    info.save_data_type = static_cast<u8>(type);
+    info.save_data_rank = static_cast<u8>(rank);
+    info.save_data_index = static_cast<unsigned short>(index);
+    return true;
+}
+
+bool readEntry(FILE* f,ManifestEntry& e) {
+    if(!line(f))return false;
+    char kind=0;
+    int end=0;
+    long long size=-1;
+    if(sscanf(g_line,"%c %lld %64s %1538s%n",&kind,&size,e.hash,g_hexPath,&end)!=4||strcmp(g_line+end,"\n")||(kind!='D'&&kind!='F')||size<0)return false;
+    const size_t n=strlen(g_hexPath);
+    if(!n||n%2||n/2>=sizeof(e.path))return false;
+    for(size_t j=0;j<n;j+=2) {
+        int hi=nxc::codec::hexDigit(g_hexPath[j]),lo=nxc::codec::hexDigit(g_hexPath[j+1]);
+        if(hi<0||lo<0||(hi==0&&lo==0))return false;
+        e.path[j/2]=static_cast<char>((hi<<4)|lo);
+    }
+    e.path[n/2]=0;
+    e.dir=kind=='D';
+    e.size=size;
+    if(!validPath(e.path,true))return false;
+    if(e.dir)return size==0&&!strcmp(e.hash,"-");
+    if(strlen(e.hash)!=64)return false;
+    for(int j=0;j<64;++j)if(nxc::codec::hexDigit(e.hash[j])<0)return false;
+    return true;
+}
+// 检查实际树的类型、深度、数量；清单中的每条路径先经去重且逐项存在验证，数量相等即无漏列/多余文件。
+
+bool countTree(const char* base,int depth,int& count,nxc::Reply& r) {
+    if(depth>kMaxDepth||cancelled(r)||!regular(base,true)||++count>kMaxEntries)return false;
+    DIR* d=opendir(base);
+    if(!d)return false;
+    bool ok=true;
+    for(;;) {
+        errno=0;
+        dirent* e=readdir(d);
+        if(!e) {
+            if(errno)ok=false;
+            break;
+        }
+        if(!strcmp(e->d_name,".")||!strcmp(e->d_name,".."))continue;
+        char child[kPath];
+        if(!join(base,e->d_name,child,sizeof(child))) {
+            ok=false;
+            break;
+        }
+        struct stat st{};
+        if(lstat(child,&st)!=0) {
+            ok=false;
+            break;
+        }
+        if(S_ISDIR(st.st_mode))ok=countTree(child,depth+1,count,r);
+        else if(S_ISREG(st.st_mode))ok=(++count<=kMaxEntries);
+        else ok=false;
+        if(!ok||cancelled(r)) {
+            ok=false;
+            break;
+        }
+    }
+    if(closedir(d)!=0)ok=false;
+    return ok;
+}
+
+// 恢复按清单顺序建目录，因此 verify 必须先证明每条路径的父目录已就绪。
+bool manifestOrderValid(const ManifestEntry& entry, int previousCount) {
+    if (previousCount == 0) return entry.dir && std::strcmp(entry.path, "/") == 0;
+    if (std::strcmp(entry.path, "/") == 0) return false;
+    const char* slash = std::strrchr(entry.path, '/');
+    if (!slash) return false;
+    const size_t len = slash == entry.path ? 1 : static_cast<size_t>(slash - entry.path);
+    char parent[FS_MAX_PATH];
+    if (len >= sizeof(parent)) return false;
+    std::memcpy(parent, entry.path, len);
+    parent[len] = 0;
+    Sha256Context hash;
+    sha256ContextCreate(&hash);
+    sha256ContextUpdate(&hash, parent, len);
+    unsigned char digest[32];
+    sha256ContextGetHash(&hash, digest);
+    for (int i = 0; i < previousCount; ++i) {
+        if (g_pathDirectories[i] && std::memcmp(g_pathHashes[i], digest, sizeof(digest)) == 0) return true;
+    }
+    return false;
+}
+
+bool verifyBackup(const char* root,FsSaveDataInfo& info,Stats& s,nxc::Reply& r) {
+    if(!backupPath(root)||!regular(root,true))return false;
+    char path[kPath],data[kPath],manifest[kPath],hash[65],expected[66];
+    long long bytes=0;
+    if(!join(root,"COMPLETE",path,sizeof(path))||!regular(path))return false;
+    FILE* mark=nxc::sd::open(path,"rb");
+    if(!mark)return false;
+    bool ok=fread(expected,1,sizeof(expected),mark)==65;
+    if(fclose(mark)!=0)ok=false;
+    if(!ok||expected[64]!='\n')return false;
+    expected[64]=0;
+    if(!join(root,"manifest.nxc",manifest,sizeof(manifest))||!join(root,"data",data,sizeof(data))||!hashFile(manifest,hash,&bytes,r)||strcmp(hash,expected))return false;
+    FILE* f=nxc::sd::open(manifest,"rb");
+    if(!f)return false;
+    ok=readHeader(f,info);
+    s={};
+    while(ok) {
+        if(cancelled(r)) {
+            ok=false;
+            break;
+        }
+        int ch=fgetc(f);
+        if(ch==EOF) {
+            if(ferror(f))ok=false;
+            break;
+        }
+        ungetc(ch,f);
+        ManifestEntry e{};
+        if(s.entries>=kMaxEntries||!readEntry(f,e)||!manifestOrderValid(e,s.entries)) {
+            ok=false;
+            break;
+        }
+        Sha256Context c;
+        sha256ContextCreate(&c);
+        sha256ContextUpdate(&c,e.path,strlen(e.path));
+        unsigned char digest[32];
+        sha256ContextGetHash(&c,digest);
+        for(int j=0;j<s.entries;++j)if(!memcmp(g_pathHashes[j],digest,32)) {
+            ok=false;
+            break;
+        }
+        if(!ok)break;
+        g_pathDirectories[s.entries] = e.dir;
+        memcpy(g_pathHashes[s.entries++],digest,32);
+        if(!join(data,e.path,path,sizeof(path))) {
+            ok=false;
+            break;
+        }
+        if(e.dir) {
+            if(!regular(path,true)) {
+                ok=false;
+                break;
+            }
+            ++s.dirs;
+        }
+        else {
+            long long n=0;
+            if(!hashFile(path,hash,&n,r)||n!=e.size||strcmp(hash,e.hash)) {
+                ok=false;
+                break;
+            }
+            ++s.files;
+            if(s.bytes>LLONG_MAX-n) {
+                ok=false;
+                break;
+            }
+            s.bytes+=n;
+        }
+    }
+    if(fclose(f)!=0)ok=false;
+    int actual=0;
+    if(ok)ok=countTree(data,0,actual,r)&&actual==s.entries;
+    return ok;
+}
+
+void cmdVerify(const nxc::Args& a,nxc::Reply& r) {
+    FsSaveDataInfo i{};
+    Stats s{};
+    if(!verifyBackup(a.get("from"),i,s,r)) {
+        if(!r.hasError())r.fail(422,"backup-invalid: 完成标志/清单/身份/文件长度或SHA256不匹配");
+        return;
+    }
+    emitInfo(r,i);
+    r.kvi("files",s.files);
+    r.kvi("dirs",s.dirs);
+    r.kvi("bytes",s.bytes);
+    r.kv("result","verified");
+}
+
+bool sameIdentity(const FsSaveDataInfo& a,const FsSaveDataInfo& b) {
+    return a.application_id==b.application_id&&a.save_data_id==b.save_data_id&&a.uid.uid[0]==b.uid.uid[0]&&a.uid.uid[1]==b.uid.uid[1]&&a.save_data_space_id==b.save_data_space_id&&a.save_data_type==b.save_data_type&&a.save_data_rank==b.save_data_rank&&a.save_data_index==b.save_data_index&&a.system_save_data_id==b.system_save_data_id;
+}
+
+bool appStopped(u64 app,nxc::Reply& r) {
+    if(R_FAILED(pmdmntInitialize())) {
+        r.fail(500,"cannot-check-running-app");
+        return false;
+    }
+    static u64 pids[256];
+    s32 n=0;
+    bool ok=R_SUCCEEDED(svcGetProcessList(&n,pids,256))&&n>=0&&n<=256;
+    for(s32 j=0;ok&&j<n;++j) {
+        u64 id=0;
+        if(R_FAILED(pmdmntGetProgramId(&id,pids[j]))) {
+            ok=false;
+            break;
+        }
+        if(id==app) {
+            pmdmntExit();
+            r.fail(409,"target-app-running: 先完全关闭应用再恢复");
+            return false;
+        }
+    }
+    pmdmntExit();
+    if(!ok)r.fail(500,"cannot-check-running-app");
+    return ok;
+}
+
+bool restoreFile(FsFileSystem* fs,const char* data,const ManifestEntry& e,nxc::Reply& r) {
+    char src[kPath];
+    if(!join(data,e.path,src,sizeof(src)))return false;
+    FILE* in=nxc::sd::open(src,"rb");
+    if(!in)return false;
+    bool ok=R_SUCCEEDED(fsFsCreateFile(fs,e.path,e.size,0));
+    FsFile out;
+    bool opened=ok&&R_SUCCEEDED(fsFsOpenFile(fs,e.path,FsOpenMode_Write,&out));
+    if(!opened)ok=false;
+    long long off=0;
+    Sha256Context hash;
+    sha256ContextCreate(&hash);
+    while(ok&&off<e.size) {
+        if(cancelled(r)) {
+            ok=false;
+            break;
+        }
+        size_t want=static_cast<size_t>((e.size-off)<static_cast<long long>(sizeof(g_copy))?(e.size-off):sizeof(g_copy));
+        size_t got=fread(g_copy,1,want,in);
+        if(got!=want||R_FAILED(fsFileWrite(&out,off,g_copy,got,0))) {
+            ok=false;
+            break;
+        }
+        sha256ContextUpdate(&hash,g_copy,got);
+        off+=got;
+    }
+    if(ok&&(fgetc(in)!=EOF||ferror(in)))ok=false;
+    char digest[65];
+    finishHash(hash,digest);
+    if(strcmp(digest,e.hash))ok=false;
+    if(fclose(in)!=0)ok=false;
+    if(opened) {
+        if(R_FAILED(fsFileFlush(&out)))ok=false;
+        fsFileClose(&out);
+    }
+    return ok;
+}
+
+void cmdRestore(const nxc::Args& a,nxc::Reply& r) {
+    if(!a.get("confirm")||strcmp(a.get("confirm"),"RESTORE_SAVE")) {
+        r.fail(403,"confirm-required: confirm=RESTORE_SAVE，将完整替换目标存档");
+        return;
+    }
+    FsSaveDataInfo target{},backup{};
+    Stats s{};
+    if(!selectSave(a,&target,r))return;
+    const char* from=a.get("from");
+    if(!verifyBackup(from,backup,s,r)) {
+        if(!r.hasError())r.fail(422,"backup-invalid: 恢复前完整校验失败，未写目标");
+        return;
+    }
+    if(!sameIdentity(target,backup)) {
+        r.fail(409,"backup-target-identity-mismatch: app/save_id/uid/space/type/rank/index必须完全一致");
+        return;
+    }
+    if(!appStopped(target.application_id,r)||cancelled(r))return;
+    char manifest[kPath],data[kPath];
+    if(!join(from,"manifest.nxc",manifest,sizeof(manifest))||!join(from,"data",data,sizeof(data))) {
+        r.fail(400,"path-too-long");
+        return;
+    }
+    FILE* f=nxc::sd::open(manifest,"rb");
+    if(!f) {
+        r.fail(500,"open-manifest-failed");
+        return;
+    }
+    FsSaveDataInfo header{};
+    bool ok=readHeader(f,header)&&sameIdentity(header,backup);
+    FsFileSystem fs;
+    auto attr=attribute(target);
+    bool mounted=ok&&R_SUCCEEDED(fsOpenSaveDataFileSystem(&fs,static_cast<FsSaveDataSpaceId>(target.save_data_space_id),&attr));
+    if(!mounted)ok=false;
+    // 至此清单与所有文件已完整验证，且应用已关闭；从这里才允许目标写入。
+    if(ok)ok=R_SUCCEEDED(fsFsCleanDirectoryRecursively(&fs,"/"));
+    for(int j=0;ok&&j<s.entries;++j) {
+        if(cancelled(r)) {
+            ok=false;
+            break;
+        }
+        ManifestEntry e{};
+        if(!readEntry(f,e)) {
+            ok=false;
+            break;
+        }
+        if(e.dir) {
+            if(strcmp(e.path,"/"))ok=R_SUCCEEDED(fsFsCreateDirectory(&fs,e.path));
+        }
+        else ok=restoreFile(&fs,data,e,r);
+    }
+    if(fclose(f)!=0)ok=false;
+    if(ok&&cancelled(r))ok=false;
+    if(ok)ok=R_SUCCEEDED(fsFsCommit(&fs));
+    if(mounted)fsFsClose(&fs);
+    if(!ok) {
+        if(!r.hasError())r.fail(500,"restore-failed-or-commit-failed: 不能确认恢复成功，保留备份并检查目标存档");
+        return;
+    }
+    emitInfo(r,target);
+    r.kvi("files",s.files);
+    r.kvi("bytes",s.bytes);
+    r.kv("result","restored");
+}
 
 const nxc::Param kListParams[] = {
-    {"space", "user|system|sduser|sdsystem|all", false, "user",
-     "存档空间：user(默认) | system | sduser | sdsystem | all"},
-    {"app",   "title-id(0x...)", false, nullptr,
-     "只列这个 title 的存档（十六进制、认 0x；值就用本方法输出里的 app=）"},
-    {"count", "int", false, "20",
-     "最多几条（允许 1..200；越界回落默认 20 并在回包里提示）"},
-};
-const nxc::MethodInfo kInfoList = {
-    kListParams, 3, "read",
-    "枚举设备上的存档（只读）。\n"
-    "作用: 看有哪些存档、属于哪个 title／用户、多大、在哪个空间。\n"
-    "参数:\n"
-    "  space = user(默认)|system|sduser|sdsystem|all —— 存档所在空间。\n"
-    "  app   = title id 过滤，十六进制并认 0x（值就用本方法输出里的 app=）。\n"
-    "          ★ 解析不出会直接报 400，不会静默变成「不过滤」。\n"
-    "  count = 最多几条，默认 20，允许 1..200；越界回落 20 并在回包里提示。\n"
-    "示例:\n"
-    "  save.list\n"
-    "  save.list space=all count=50\n"
-    "  save.list app=0x010015100B514000\n"
-    "注意:\n"
-    "  ★ app 支持 0x 十六进制 —— 直接把本方法打印的 app= 复制回来即可。\n"
-    "  ★ 只列不读：要看内容或做备份，请用 save.backup。\n"
-    "返回:\n"
-    "  每个存档一行 app= save_id= space= type= size= uid=；\n"
-    "  末行 count=<实际列出数> scanned=<扫描到的总数>，并附 note 提示。\n"
-    "相关: save.backup\n",
+    {"space", "user|system|sduser|sdsystem|all", false, "user", "存档空间"},
+    {"app", "title-id", false, nullptr, "可选应用ID过滤"},
+    {"count", "int", false, "20", "1..200"},
+    {"offset", "int", false, "0", "跳过过滤后的存档条数，目录变化请重新枚举"},
 };
 const nxc::Param kBackupParams[] = {
-    {"app", "title-id(0x...)", true, nullptr,
-     "要备份的 title id（十六进制、认 0x，如 0x010021C000B6A000）"},
-    {"to",  "str", false, nullptr,
-     "目标目录，必须位于 /config/nxc/saves 之下；不填则默认 /config/nxc/saves/<app 的16位十六进制>"},
+    {"app", "title-id", true, nullptr, "应用ID，认0x"},
+    {"uid", "hex32", false, nullptr, "save.list输出的32位用户ID"},
+    {"save_id", "id", false, nullptr, "save.list输出的存档ID"},
+    {"space", "str", false, "all", "可选空间选择"},
+    {"to", "str", false, nullptr, "必须是/config/nxc/saves下不存在的新目录；默认独立唯一目录"},
+};
+const nxc::Param kVerifyParams[] = {
+    {"from", "str", true, nullptr, "备份目录，必须含manifest.nxc、data、COMPLETE"},
+};
+const nxc::Param kRestoreParams[] = {
+    {"app", "title-id", true, nullptr, "目标应用ID"},
+    {"uid", "hex32", false, nullptr, "目标用户ID"},
+    {"save_id", "id", false, nullptr, "目标存档ID"},
+    {"space", "str", false, "all", "目标空间"},
+    {"from", "str", true, nullptr, "完整备份目录"},
+    {"confirm", "str", true, nullptr, "必须为RESTORE_SAVE；将完整替换目标存档"},
+};
+const nxc::MethodInfo kInfoList = {
+    kListParams, 4, "read",
+    "枚举存档。save.list [space=all] [app=0x...] [offset=0] [count=20]。\n"
+    "输出app/save_id/uid/space/type/size，供明确选择；末行count/offset/next_offset/truncated。",
 };
 const nxc::MethodInfo kInfoBackup = {
-    kBackupParams, 2, "write",
-    "★ 把一个 title 的存档整棵目录树复制到 SD 卡（只读存档、只往 SD 写）。\n"
-    "作用: 在改内存／改存档之前，先留一份可回退的备份。\n"
-    "参数:\n"
-    "  app = 必填，要备份的 title id，十六进制并认 0x。\n"
-    "        值可直接用 save.list 输出里的 app=（形如 0x010021C000B6A000）。\n"
-    "  to  = 可选，目标目录，必须位于 /config/nxc/saves 之下（否则 403）。\n"
-    "        不填时默认 /config/nxc/saves/<app 的 16 位十六进制>。\n"
-    "示例:\n"
-    "  save.backup app=0x010021C000B6A000\n"
-    "  save.backup app=0x010021C000B6A000 to=/config/nxc/saves/botw_before_edit\n"
-    "注意:\n"
-    "  ★ 一个文件都没复制出来就回 ERROR（不再「零产出却回 OK」）。\n"
-    "  ★ 部分失败时 result=partial 并带 first=<第一条原因>，别把 partial 当成功。\n"
-    "  ★ 整个存档目录树会复制到 /config/nxc/saves/<app 十六进制>/ 下。\n"
-    "  ★ 只做「备份出来」，不做「写回存档」（恢复风险高，暂不支持）。\n"
-    "返回:\n"
-    "  app= to= files= dirs= bytes= failed= result=ok|partial（有失败时加 first=）。\n"
-    "相关: save.list mem.write fs.read\n",
+    kBackupParams, 5, "write",
+    "save.backup app=0x... [uid=<32位十六进制>] [save_id=0x...] [space=user] "
+    "[to=/config/nxc/saves/new]\n"
+    "多匹配409，必须细化选择；默认新建唯一目录，显式目录存在也409，绝不覆盖。\n"
+    "data保存目录树，manifest.nxc记录身份及每条路径/长度/SHA256，COMPLETE最后写入。\n"
+    "先关闭目标应用再备份；正在运行或无法确认关闭时拒绝创建备份目录。\n"
+    "任意失败回ERR，未完成备份不可恢复。空存档合法；上限4096条、16层。",
 };
-
-}  // namespace
-
+const nxc::MethodInfo kInfoVerify = {
+    kVerifyParams, 1, "read",
+    "save.verify from=/config/nxc/saves/<backup>\n"
+    "验证完成标志与清单哈希、全部文件路径/长度/SHA256和完整目录树；\n"
+    "拒绝多余文件、重复路径、符号链接；根目录必须首条出现，父目录必须先于子项。返回result=verified。",
+};
+const nxc::MethodInfo kInfoRestore = {
+    kRestoreParams, 6, "write",
+    "save.restore app=0x... [uid=...] [save_id=0x...] "
+    "from=/config/nxc/saves/<backup> confirm=RESTORE_SAVE\n"
+    "警告：完整替换目标存档，删除目标额外文件。\n"
+    "先完整验证备份和app/save_id/uid/space/type/rank/index身份，拒绝正在运行的目标应用，\n"
+    "写后检查flush和commit。任意失败回ERR且不能认定恢复成功；保留原备份。\n"
+    "建议恢复前再备份目标；提交失败或恢复中断须检查目标。\n"
+    "本实现仅经宿主测试与交叉构建，尚未真机验收。",
+};
 const nxc::Method kMethods[] = {
-    {"list",   "枚举存档：可选 space=user|system|sduser|sdsystem|all，app=<title id>，count=<最多几条，默认20，上限200>", cmdList,   &kInfoList},
-    {"backup", "★ 把某个 title 的存档整棵目录树备份到 SD：app=<title id> [to=/config/nxc/saves/<app>]", cmdBackup, &kInfoBackup},
+    {"list", "枚举存档及精确选择身份", cmdList, &kInfoList},
+    {"backup", "独立目录备份、清单与SHA256", cmdBackup, &kInfoBackup},
+    {"verify", "验证完整备份与全部文件", cmdVerify, &kInfoVerify},
+    {"restore", "确认口令后校验并恢复同身份存档", cmdRestore, &kInfoRestore},
 };
-
 }  // namespace
 
-NXC_DEFINE_TOOL_EX(nxc_tool_save, "save",
-    "存档枚举与备份（改内存前的安全前提）", kMethods,
-    "管存档：枚举（save.list）与把整棵存档目录树备份到 SD（save.backup）。\n"
-    "什么时候用它：\n"
-    "  · 动内存之前先备份 —— 改内存的下游往往就是存档，改坏了没有后悔药。\n"
-    "  · 想知道某个游戏有没有存档、在哪个空间、多大。\n"
-    "工作流：先 save.list 找到 app → 再 save.backup 备份 → 之后才 mem.write。\n"
-    "边界：\n"
-    "  · 只做只读地把存档复制出来，不做写回／恢复。\n"
-    "  · 只写 SD 卡上的 /config/nxc/saves；不会改动设备上的存档本身。\n"
-    "相关工具：mem（改内存前先备份）、fs（把备份取回本地）、title（列 title）\n"
+NXC_DEFINE_TOOL_EX(nxc_tool_save, "save", "存档枚举、备份、完整性验证与恢复", kMethods,
+    "先save.list取得app/uid/save_id，再save.backup到独立新目录；save.verify验证完整性。\n"
+    "save.restore需要confirm=RESTORE_SAVE、相同存档身份及关闭目标应用，写前验证全部文件，写后检查commit。\n"
+    "备份最多4096条目录/文件、16层；不覆盖旧备份，只有COMPLETE有效才可恢复。"
 );

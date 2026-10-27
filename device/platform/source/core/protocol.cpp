@@ -9,6 +9,7 @@
 #include "platform.hpp"
 #include "sd.hpp"     // ★ 需要 nxc::sd::kEnabled（实验期工具拦截）
 #include "net.hpp"    // ★ 需要 nxc::net::kListenEnabled（同理）
+#include "jobs.hpp"
 #include "power.hpp"  // ★ 需要 nxc::power::*（睡眠时收口，见 core/power.hpp）
 
 #include <switch.h>
@@ -46,10 +47,16 @@ namespace {
 //   还按 1024 就会被当成"超长行"整条丢掉。每个客户端各持一份（kMaxClients=4 → 32KB）。
 constexpr int kRequestBytes = 8192;
 
-// Args(≈13KB) 与 Reply(≈8KB) 加起来超过 16KB 的默认线程栈，所以放成静态的。
-// 服务端是**单线程**的（多客户端靠 poll 轮询，见 serveForever），因此不需要加锁。
+// 参数与应答仅由串行工作线程使用，放在静态区避免挤占线程栈。
 Args  g_args;
 Reply g_reply;
+using WorkQueue = jobs::Queue<8, kRequestBytes, kReplyBytes + 512>;
+WorkQueue g_work;
+std::atomic<int> g_networkOperations{0};
+WorkQueue::Job* g_currentJob = nullptr; // 仅工作线程访问
+Thread g_worker;
+UEvent g_workReady;
+alignas(0x1000) unsigned char g_workerStack[0x20000];
 
 // ---------------------------------------------------------------- 收发
 // 注意：**已经没有"一次阻塞读一行"的函数了**。
@@ -58,21 +65,16 @@ Reply g_reply;
 
 bool sendAll(int fd, const char* data, int len) {
     int off = 0;
-    int stalls = 0;
+    int interrupts = 0;
     while (off < len) {
         const int n = ::send(fd, data + off, len - off, 0);
         if (n > 0) {
             off += n;
-            stalls = 0;
+            interrupts = 0;
             continue;
         }
-        // ★ socket 现在是非阻塞的（见 serveForever 里的 O_NONBLOCK），
-        //   发送缓冲满时会返回 EAGAIN。这里短暂让出 CPU 再试，别因为非阻塞就把回包丢掉。
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (++stalls > 300) return false;          // 约 300ms 还发不出去，认输
-            svcSleepThread(1000000ULL);                 // 1ms
-            continue;
-        }
+        // 快速应答不等待慢客户端；完整工具应答由 flushResponses 分步发送。
+        if (n < 0 && errno == EINTR && ++interrupts < 3) continue;
         return false;
     }
     return true;
@@ -99,6 +101,9 @@ void parseRequest(char* line, const char*& method, Args& args) {
         char* eq = std::strchr(tok, '=');
         if (eq != nullptr) {
             *eq = '\0';
+            // C 字符串不能承载嵌入 NUL，不能把路径后半段静默丢掉。
+            for (const char* v = eq + 1; *v; ++v)
+                if (v[0] == '%' && v[1] == '0' && v[2] == '0') args.reject();
             codec::unescapeValueInPlace(eq + 1);
             args.add(tok, eq + 1);
         } else {
@@ -427,7 +432,22 @@ void dispatch(const char* method, const Args& args, Reply& reply) {
     const char* sub = dot + 1;
     for (int i = 0; i < tool->methodCount; ++i) {
         if (std::strcmp(tool->methods[i].name, sub) == 0) {
-            tool->methods[i].handler(args, reply);
+            const Method& m = tool->methods[i];
+            if (m.info != nullptr) {
+                for (int j = 0; j < m.info->paramCount; ++j) {
+                    const Param& p = m.info->params[j];
+                    if (p.name == nullptr || p.type == nullptr || args.get(p.name) == nullptr) continue;
+                    if (std::strcmp(p.type, "int") == 0 || std::strcmp(p.type, "0|1") == 0) {
+                        const auto v = args.getInt(p.name, 0);
+                        if (args.invalid() || (std::strcmp(p.type, "0|1") == 0 && v != 0 && v != 1)) {
+                            reply.failf(400, "invalid-integer: %s", p.name); return;
+                        }
+                    }
+                }
+            }
+            if (host::operationCancelled()) { reply.fail(409, "operation-cancelled"); return; }
+            m.handler(args, reply);
+            if (args.invalid()) reply.fail(400, "invalid-parameters");
             if (reply.overflowed()) reply.fail(500, "reply-too-large");
             return;
         }
@@ -436,37 +456,20 @@ void dispatch(const char* method, const Args& args, Reply& reply) {
 }
 
 // ---------------------------------------------------------------- 回包
-bool sendReply(int fd, Reply& reply) {
-    // ★★★ 2026-10-06 晚：这个缓冲从 64 提到 384，并且**把长度夹住**。
-    //
-    //   原来 64 字节装不下 `ERR 400 missing-app: 需要 app=<title id，如 0x010021C000B6A000>\n`
-    //   （实测这条是 68 字节），于是同时犯两个错：
-    //     ① 只写进 63 字节 + NUL ⇒ 结尾的 UTF-8 汉字被切一半，PC 侧显示成乱码；
-    //     ② ★★ `snprintf` 返回的是「**本该写多少**」(68)，而代码把它当发送长度用了 ⇒
-    //        `sendAll` 从 64 字节的数组里**多读 4 字节栈垃圾**发出去（越界读），
-    //        并且第 67 字节的 `\n` 根本不在缓冲里 ⇒ **错误行结尾丢掉换行**
-    //        （客户端要靠后续/超时才收帧，表现为莫名的卡顿）。
-    //
-    //   夹取长度之后：超长文案依旧会被截断（可接受的降级），但**绝不越界读、也一定有换行**。
-    char header[384];
-    constexpr int kHeaderCap = static_cast<int>(sizeof(header));
-
+void encodeReply(WorkQueue::Job& job, Reply& reply) {
+    int n = 0;
     if (reply.hasError()) {
-        int n = std::snprintf(header, sizeof(header), "ERR %d %s\n",
-                              reply.errCode(), reply.errMsg());
-        if (n < 0) return false;
-        if (n > kHeaderCap - 1) n = kHeaderCap - 1;
-        return sendAll(fd, header, n);
+        n = std::snprintf(job.output, sizeof(job.output), "ERR %d %s\n", reply.errCode(), reply.errMsg());
+    } else {
+        const bool body = reply.body()[0] != '\0';
+        n = std::snprintf(job.output, sizeof(job.output), "OK %d\n%s%s",
+                          body ? reply.lineCount() : 0, reply.body(), body ? "\n" : "");
     }
-
-    const bool hasBody = (reply.body()[0] != '\0');
-    const int lines = hasBody ? reply.lineCount() : 0;
-    const int n = std::snprintf(header, sizeof(header), "OK %d\n", lines);
-    if (!sendAll(fd, header, n)) return false;
-    if (!hasBody) return true;
-
-    if (!sendAll(fd, reply.body(), static_cast<int>(std::strlen(reply.body())))) return false;
-    return sendAll(fd, "\n", 1);
+    if (n < 0 || n >= static_cast<int>(sizeof(job.output))) {
+        std::strcpy(job.output, "ERR 500 reply-too-large\n");
+        n = static_cast<int>(std::strlen(job.output));
+    }
+    job.outputBytes = n;
 }
 
 }  // namespace
@@ -485,24 +488,29 @@ struct ClientSlot {
     char line[kRequestBytes];
     int len = 0;
     bool dropping = false;
+    uint64_t generation = 0;
+    bool readClosed = false;
 };
 
 ClientSlot g_clients[kMaxClients];
 
-// 处理一条完整的请求行；返回 false 表示这条连接该关掉了。
-bool handleLine(int fd, char* line, bool tooLong) {
+// 工作线程处理完整请求，不接触socket。
+void processLine(char* line, bool tooLong) {
     const char* method = "";
     parseRequest(line, method, g_args);
 
     g_reply.reset();
     if (tooLong) {
         g_reply.fail(413, "request-too-long");
+    } else if (g_args.invalid()) {
+        g_reply.fail(400, "invalid-or-too-large-parameters");
     } else if (std::strcmp(method, "__TOO_LONG__") == 0) {
         g_reply.fail(413, "request-too-long");
     } else if (*method == '\0') {
         g_reply.fail(400, "empty-request");
     } else {
         dispatch(method, g_args, g_reply);
+        if (g_args.invalid()) g_reply.fail(400, "invalid-parameters");
 
         // ★ 诊断增强（2026-10-05，来自一次真实的误判）：
         //   请求里出现「没有 `=` 的词」时，最可能的原因就是**值里有空格** ——
@@ -525,8 +533,84 @@ bool handleLine(int fd, char* line, bool tooLong) {
         }
     }
 
-    if (!sendReply(fd, g_reply)) return false;
     log::ring("req %s", method);
+}
+
+// 系统服务和工具状态仅由这个工作线程串行访问；网络线程随时可以收口。
+void commandWorker(void*) {
+    for (;;) {
+        WorkQueue::Job* job = g_work.take();
+        if (job == nullptr) {
+            // 持久心跳由唯一访问SD/sm的工作线程写，网络线程始终不做磁盘IO。
+            const Result rc = waitSingle(waiterForUEvent(&g_workReady), 30000000000ULL);
+            if (R_FAILED(rc) && !power::sleepRequested())
+                log::watch("worker idle (psc_events=%d, psc_sleep=%d)", power::eventCount(), power::sleepEventCount());
+            continue;
+        }
+        g_currentJob = job;
+        if (job->cancelled.load(std::memory_order_acquire) || power::sleepRequested()) {
+            g_reply.reset(); g_reply.fail(409, "operation-cancelled");
+        } else {
+            processLine(job->input, job->tooLong);
+        }
+        encodeReply(*job, g_reply);
+        g_currentJob = nullptr;
+        g_work.finish(*job);
+    }
+}
+
+bool startWorker() {
+    ueventCreate(&g_workReady, true);
+    const Result rc = threadCreate(&g_worker, commandWorker, nullptr, g_workerStack, sizeof(g_workerStack), 0x2C, -2);
+    if (R_FAILED(rc)) { log::ring("worker create failed rc=0x%X", rc); return false; }
+    const Result started = threadStart(&g_worker);
+    if (R_FAILED(started)) { threadClose(&g_worker); log::ring("worker start failed rc=0x%X", started); return false; }
+    return true;
+}
+
+void closeClient(int slot) {
+    auto& c = g_clients[slot];
+    g_work.cancelClient(slot, c.generation);
+    if (c.fd >= 0) ::close(c.fd);
+    c.fd = -1; c.len = 0; c.dropping = false; c.readClosed = false;
+}
+
+void flushResponses() {
+    g_work.discardDisconnected([](int slot, uint64_t generation) {
+        return g_clients[slot].fd >= 0 && g_clients[slot].generation == generation;
+    });
+    for (int i = 0; i < kMaxClients; ++i) {
+        auto& c = g_clients[i];
+        if (c.fd < 0) continue;
+        auto* j = g_work.completeFor(i, c.generation);
+        if (j == nullptr) { if (c.readClosed && !g_work.hasClient(i,c.generation)) closeClient(i); continue; }
+        const int sent = ::send(c.fd, j->output + j->sent, j->outputBytes - j->sent, 0);
+        if (sent > 0) {
+            j->sent += sent;
+            if (j->sent == j->outputBytes) g_work.retire(*j);
+        } else if (sent == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+            closeClient(i);
+        }
+    }
+}
+
+bool submitLine(int slot, char* line, bool tooLong) {
+    auto& c = g_clients[slot];
+    // hello 在独立连接上不经过工作队列，可在耗时操作期间检查平台是否存活。
+    if (!tooLong && !g_work.hasClient(slot, c.generation) && std::strcmp(line, "hello") == 0) {
+        char out[192];
+        const int n = std::snprintf(out, sizeof(out), "OK 4\nplatform=%s\nproto=1\nboot=%d\ntools=%d\n",
+                                    kPlatformName, log::bootCount(), reg::toolCount());
+        return sendAll(c.fd, out, n);
+    }
+    if (!tooLong && !g_work.hasClient(slot, c.generation) && std::strcmp(line, "cancel") == 0) {
+        g_work.cancelAll();
+        static const char answer[] = "OK 1\ncancel_requested=1\n";
+        return sendAll(c.fd, answer, sizeof(answer)-1);
+    }
+    auto* job = g_work.submit(slot, c.generation, line, tooLong);
+    if (job == nullptr) return false; // 关闭过载连接，不发送乱序错误帧。
+    ueventSignal(&g_workReady);
     return true;
 }
 
@@ -607,6 +691,7 @@ int openListener() {
 void serveForever(int listenFd, bool keepListenerOpen) {
     pollfd fds[kMaxClients + 1];
     int slots[kMaxClients + 1];
+    if (!startWorker()) { if (listenFd >= 0) ::close(listenFd); return; }
     int listener = listenFd;          // -1 ⇒ 现在没有监听口
     log::ring("net: serveForever listen=%d keepOpen=%d", listener, keepListenerOpen ? 1 : 0);
 
@@ -619,21 +704,14 @@ void serveForever(int listenFd, bool keepListenerOpen) {
         //   ★ 纪律 1：**关干净之后才让通知线程去应答**（应答早了 = 等于没关）。
         //   ★ 纪律 2：**fd 只在这一处（主线程）关**，通知线程只碰标志位（见 `core/power.hpp`）。
         if (nxc::power::sleepRequested()) {
-            // ★★★ 先写黑匣子（**由主线程写 SD**：通知线程不许碰文件，见 power.hpp 纪律 3）。
-            //   为什么必须在关 socket **之前**写：这一段就是"我们确实收到了 ReadySleep"
-            //   的唯一幸存证据 —— 如果关了 socket 之后崩机，环形日志会随进程一起消失，
-            //   只剩这个按开机号命名的文件。
-            log::watch("PSC 睡眠 state=%d → 先记一笔再关 socket（events=%d）",
-                       nxc::power::lastState(), nxc::power::eventCount());
-
+            g_work.cancelAll();
             if (listener >= 0) { ::close(listener); listener = -1; }
-            for (int i = 0; i < kMaxClients; ++i) {
-                if (g_clients[i].fd >= 0) { ::close(g_clients[i].fd); g_clients[i].fd = -1; }
-                g_clients[i].len = 0;
-                g_clients[i].dropping = false;
-            }
+            for (int i = 0; i < kMaxClients; ++i) closeClient(i);
+            // net.probe 自有socket由工作线程在50ms轮询内关闭；确认后才报告。
+            for (int wait=0; g_networkOperations.load(std::memory_order_acquire)>0 && wait<300; wait+=5)
+                svcSleepThread(5000000ULL);
             // ★ 关干净了，通知线程这才去 Ack（它最多等 900ms）。
-            nxc::power::reportSocketsClosed();
+            if (g_networkOperations.load(std::memory_order_acquire)==0) nxc::power::reportSocketsClosed();
             log::ring("power: 全部 socket 已关闭（睡眠），已回报通知线程");
 
             while (nxc::power::sleepRequested()) svcSleepThread(50000000ULL);   // 50ms 一轮，醒来反应快
@@ -642,7 +720,7 @@ void serveForever(int listenFd, bool keepListenerOpen) {
             // ★ 醒来重开监听口。开不上不致命 —— 下一轮循环会用同一条重开逻辑再试。
             listener = openListener();
             log::ring("power: 醒来，listener fd=%d", listener);
-            log::watch("PSC 醒来 state=%d → 重开监听口 fd=%d（mode=%s）",
+            log::ring("PSC 醒来 state=%d → 重开监听口 fd=%d（mode=%s）",
                        nxc::power::lastState(), listener, nxc::net::modeName(nxc::net::mode()));
             continue;
         }
@@ -659,6 +737,7 @@ void serveForever(int listenFd, bool keepListenerOpen) {
             log::ring("net: listener reopened fd=%d", listener);
         }
 
+        flushResponses();
         int n = 0;
         if (listener >= 0) {
             fds[n].fd = listener;
@@ -669,7 +748,7 @@ void serveForever(int listenFd, bool keepListenerOpen) {
         }
 
         for (int i = 0; i < kMaxClients; ++i) {
-            if (g_clients[i].fd < 0) continue;
+            if (g_clients[i].fd < 0 || g_clients[i].readClosed) continue;
             fds[n].fd = g_clients[i].fd;
             fds[n].events = POLLIN;
             fds[n].revents = 0;
@@ -681,30 +760,17 @@ void serveForever(int listenFd, bool keepListenerOpen) {
         //   ⇒ **绝不能拿 n=0 去调 `poll(..., -1)`**：那会**永久阻塞**，模块从此不再响应。
         //   歇一秒重来（下一轮会再试着重开监听口）。
         if (n == 0) {
-            svcSleepThread(1000000000ULL);
+            svcSleepThread(100000000ULL);
             continue;
         }
 
-        // ★★ 2026-10-06：把 poll 超时从 `-1`（永久阻塞）改成 **30 秒**，并在每次超时时写一条
-        //   **黑匣子心跳**（`log::watch`）。为什么值得：
-        //     · 老文档里"我们死在睡眠前/中/后"一直答不出来 —— 因为没有"我们活着"的记录；
-        //     · 心跳里同时有**系统 tick 与墙钟** ⇒ 睡眠时 tick 停、墙钟继续走，
-        //       **两者差值一跳就是"确实睡过"的铁证**，而且**崩机重启也不会冲掉**（文件名带开机号）。
-        //   ★ 会不会因此改变崩溃行为？不会 —— **"周期唤醒"这条早就被排除过**：
-        //     D 轮把 poll 改成永久阻塞之后**仍然崩**（见 docs/改动日志-平台.md）。
-        //     而且现在的崩因是"持有监听口"本身，与我们醒不醒无关。
-        // ★★ 超时从 30 秒 → 250ms → **100ms**：为了**尽快看到"要睡了"的标志**。
-        //   为什么还要再压：通知线程收到 `ReadySleep` 后**最多只等 900ms** 才 Ack
-        //   （见 power.hpp 纪律 1 —— 绝不能让 PSC 等我们等到超时）。
-        //   ⇒ 主线程必须在这个预算内响应，100ms 的轮询周期留足了余量。
-        //   ★ 这**不引入新变量**："周期唤醒"这条早就被排除过（D 轮改成永久阻塞后仍然崩）。
-        //   ★ 心跳仍按 ~30 秒的节奏写：100ms × 300。
-        const int pollMs = 100;
+        // 空闲100ms内响应睡眠；有工作时5ms检查应答，避免每个上传分块额外等100ms。
+        const int pollMs = g_work.hasWork() ? 5 : 100;
         const int ready = ::poll(fds, static_cast<nfds_t>(n), pollMs);
         if (ready == 0) {
             static int s_servingTick = 0;
             if (++s_servingTick % 300 == 0) {   // ~30 秒一条
-                log::watch("serving tick=%d (mode=%s, clients=%d, listener=%d, psc_events=%d, psc_sleep=%d)",
+                log::ring("serving tick=%d (mode=%s, clients=%d, listener=%d, psc_events=%d, psc_sleep=%d)",
                            s_servingTick / 300, nxc::net::modeName(nxc::net::mode()),
                            activeClientCount(), listener >= 0 ? 1 : 0,
                            nxc::power::eventCount(), nxc::power::sleepEventCount());
@@ -745,6 +811,11 @@ void serveForever(int listenFd, bool keepListenerOpen) {
                     continue;
                 }
 
+                // 接入后立即验证非阻塞，包含满载拒绝分支。
+                const int clientFlags = ::fcntl(fd, F_GETFL, 0);
+                if (clientFlags < 0 || ::fcntl(fd, F_SETFL, clientFlags | O_NONBLOCK) < 0) { ::close(fd); continue; }
+                const int actualClientFlags = ::fcntl(fd,F_GETFL,0);
+                if (actualClientFlags < 0 || !(actualClientFlags & O_NONBLOCK)) { ::close(fd); continue; }
                 int slot = -1;
                 for (int i = 0; i < kMaxClients; ++i) {
                     if (g_clients[i].fd < 0) { slot = i; break; }
@@ -756,18 +827,11 @@ void serveForever(int listenFd, bool keepListenerOpen) {
                     ::close(fd);
                     continue;
                 }
+                ++g_clients[slot].generation;
                 g_clients[slot].fd = fd;
                 g_clients[slot].len = 0;
                 g_clients[slot].dropping = false;
-
-                // 顺手试着设成非阻塞 —— 但**不依赖它**。
-                //   实测 libnx 上 fcntl(O_NONBLOCK) 与 MSG_DONTWAIT 都不可靠，
-                //   所以读取侧改成"poll 说可读才读、每次只读一块"（见下面的读分支），
-                //   即使这里没生效也不会阻塞。
-                const int flags = ::fcntl(fd, F_GETFL, 0);
-                if (flags >= 0 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-                    log::ring("note: O_NONBLOCK not supported, relying on poll");
-                }
+                g_clients[slot].readClosed = false;
 
                 log::ring("client connected slot=%d", slot);
 
@@ -792,12 +856,15 @@ void serveForever(int listenFd, bool keepListenerOpen) {
             //   再也回不到 accept（现象：MCP 一连上，命令行就再也进不来）。
             //   现在的做法最稳：**poll 说可读才读，每次只读一块**。没读完的数据会立刻让 poll 再次就绪。
             const int slot = slots[k];
+            if (fds[k].revents & (POLLERR | POLLNVAL)) { closeClient(slot); continue; }
             char buf[256];
             bool closed = false;
 
             const int got = ::recv(g_clients[slot].fd, buf, sizeof(buf), 0);
             if (got == 0) {
-                closed = true;                                  // 对端正常关闭
+                // EOF 可能只是客户端关闭写方向；先发完此前请求的应答。
+                g_clients[slot].readClosed = true;
+                closed = !g_work.hasClient(slot, g_clients[slot].generation);
             } else if (got < 0) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) closed = true;
             } else {
@@ -808,9 +875,11 @@ void serveForever(int listenFd, bool keepListenerOpen) {
                         const bool tooLong = g_clients[slot].dropping;
                         g_clients[slot].len = 0;
                         g_clients[slot].dropping = false;
-                        if (!handleLine(g_clients[slot].fd, g_clients[slot].line, tooLong)) {
+                        if (!submitLine(slot, g_clients[slot].line, tooLong)) {
                             closed = true;
                         }
+                    } else if (c == '\0') {
+                        g_clients[slot].dropping = true;
                     } else if (c == '\r') {
                         // 忽略，容忍 CRLF
                     } else if (g_clients[slot].len + 1 >= kRequestBytes) {
@@ -823,10 +892,7 @@ void serveForever(int listenFd, bool keepListenerOpen) {
 
             if (closed) {
                 log::ring("client gone slot=%d", slot);
-                ::close(g_clients[slot].fd);
-                g_clients[slot].fd = -1;
-                g_clients[slot].len = 0;
-                g_clients[slot].dropping = false;
+                closeClient(slot);
             }
         }
     }
@@ -834,3 +900,24 @@ void serveForever(int listenFd, bool keepListenerOpen) {
 
 }  // namespace protocol
 }  // namespace nxc
+
+namespace nxc::host {
+bool beginNetworkOperation() {
+    protocol::g_networkOperations.fetch_add(1, std::memory_order_acq_rel);
+    if (operationCancelled()) { protocol::g_networkOperations.fetch_sub(1, std::memory_order_release); return false; }
+    return true;
+}
+void endNetworkOperation() { protocol::g_networkOperations.fetch_sub(1, std::memory_order_release); }
+bool operationCancelled() {
+    return power::sleepRequested() || (protocol::g_currentJob != nullptr &&
+        protocol::g_currentJob->cancelled.load(std::memory_order_acquire));
+}
+bool sleepMilliseconds(unsigned long long ms) {
+    while (ms > 0) {
+        if (operationCancelled()) return false;
+        const auto part = ms > 20 ? 20 : ms;
+        svcSleepThread(part * 1000000ULL); ms -= part;
+    }
+    return !operationCancelled();
+}
+}

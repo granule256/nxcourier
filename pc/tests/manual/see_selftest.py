@@ -20,8 +20,8 @@
 
 ## 用法
 
-    python3 pc/nxc_mcp_see_selftest.py              # 真机取帧（主机要醒着）
-    python3 pc/nxc_mcp_see_selftest.py --no-device   # 只测协议形状与降采样，不碰设备
+    python3 pc/tests/manual/see_selftest.py              # 真机取帧（主机要醒着）
+    python3 pc/tests/manual/see_selftest.py --no-device   # 仍会调用截图/控制工具，需要设备
 
 ## 判据（不通过的会直接抛断言）
 
@@ -42,8 +42,8 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SERVER = HERE / "nxc_mcp.py"
-ROOT = HERE.parent
+ROOT = HERE.parents[2]
+SERVER = ROOT / "nxc"
 OUTDIR = ROOT / "tmp"
 
 JPEG_MAGIC = b"\xff\xd8\xff"
@@ -58,7 +58,7 @@ class Server:
         self.errlog = tempfile.NamedTemporaryFile(
             "w+", prefix="nxc-selftest-", suffix=".log", delete=False)
         self.proc = subprocess.Popen(
-            [sys.executable, str(SERVER)],
+            [sys.executable, str(SERVER), "mcp"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.errlog,
             text=True, bufsize=1)
         self.next_id = 0

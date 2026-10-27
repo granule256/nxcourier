@@ -495,7 +495,7 @@ int main(int /*argc*/, char** /*argv*/) {
     //        ⇒ **往 PSC 状态机里灌假应答** ⇒ 开机的电源状态确认永远走不完 ⇒ 卡 logo。
     //        ⇒ 修法：照抄 `sys-con` —— `waiterForEvent()` + `waitSingle()` **先等事件**，
     //          再 `GetRequest`、再干活、再 `Acknowledge`（见 `core/power.cpp`）。
-    nxc::log::ring("main: PSC 收口将在监听口建好后注册（psc_mode=%s）",
+    nxc::log::ring("main: PSC 收口将在创建监听口之前注册（psc_mode=%s）",
                    nxc::power::modeName(pscMode));
 
     // ★ 无论 socket 成不成，先把为它借用的 sm 还掉（下面失败时自己会 return）。
@@ -522,37 +522,9 @@ int main(int /*argc*/, char** /*argv*/) {
                     nxc::net::listenerBacklog(),
                     nxc::net::useReuseAddr() ? 1 : 0);
 
-    // ★ 监听口统一由 `protocol::openListener()` 建（抽出去是为了让 `acceptonly` 模式
-    //   能在"客户端全断开"时把它开回来 —— 逻辑只有一份，不会两边走偏）。
-    int listenFd = nxc::protocol::openListener();
-    if (listenFd < 0) {
-        nxc::log::breadcrumb("net: openListener failed, exit");
-        return 0;
-    }
-    nxc::log::breadcrumb("net: listening on %u (keepListenerOpen=%d)",
-                         nxc::net::kPort, nxc::net::keepListenerOpen() ? 1 : 0);
-    nxc::log::watch("listening on %u (mode=%s keepOpen=%d)", nxc::net::kPort,
-                    nxc::net::modeName(nxc::net::mode()),
-                    nxc::net::keepListenerOpen() ? 1 : 0);
-
-    // ---------------------------------------------------------------- PSC 收口
-    // ★★★ 注册时机：**监听口建好之后、进服务循环之前**。
-    //   ① 对齐 `MissionControl` / `sys-con` 的"开机期注册"（已被证明安全）；
-    //   ② 顺手避开最早的开机窗口 —— 万一注册本身有问题，也不至于卡在 logo，
-    //      而是在"端口已经能用"之后才发生（有 47800 可救、可远程改回 `off`）。
-    // ★ `pscmInitialize()` 要经 `sm:` ⇒ **临时借一下、注册完立刻还**
-    //   （守"睡眠时不持有 sm"这条纪律；PSC 之后走的是自己的域会话，不再需要 sm）。
+    // 先注册睡眠收口，再创建任何监听socket；初始化失败不能留下无保护监听口。
+    bool pscReady = false;
     if (pscMode != nxc::power::Mode::Off) {
-        // ★★★ 保险：**等开机彻底完成之后再注册**（2026-10-06 晚加）。
-        //   为什么值得多等这 30 秒：这个模块有**两次"卡在 logo"**的前科，
-        //   而那种事故的恢复只能靠**拔卡改文件**（远程全断）。
-        //   ⇒ 把注册推到开机完成（实测约 35 秒）**之后**，就**从结构上取消了
-        //     "卡开机"这个失败模式** —— 万一注册有问题，最坏也只影响睡眠，
-        //     而睡眠出问题时 `47800`/FTP 仍然活着 ⇒ **能远程改回去，不用拔卡**。
-        //   ★ 只要注册成功，它就在下一次睡眠之前（约 150 秒）从容就位，不影响修法本身。
-        //   ★ 代价（诚实记下）：比 `sys-con`/`MissionControl` 的"开机期注册"晚；
-        //     万一 PSC 不接受"开机后注册"，我们**会看见**（收不到任何 PSC 状态），
-        //     而"看不见的失败"才是真正危险的 —— 这条是**可见的**。
         constexpr u64 kPscRegisterDelayMs = 30000;
         nxc::log::watch("psc: 等 %llu 秒再注册（确保开机已完成，避免「卡开机」这类事故）",
                         static_cast<unsigned long long>(kPscRegisterDelayMs / 1000));
@@ -560,6 +532,7 @@ int main(int /*argc*/, char** /*argv*/) {
 
         if (nxc::host::smOpen()) {
             const bool ok = nxc::power::start(pscMode);
+            pscReady = ok;
             nxc::log::watch("psc: 注册%s（mode=%s，id=126 deps={Fs} autoclear=1）",
                             ok ? "成功" : "**失败**", nxc::power::modeName(pscMode));
             nxc::host::smClose();   // 用完就还掉
@@ -569,6 +542,12 @@ int main(int /*argc*/, char** /*argv*/) {
         }
     }
 
+    if (!pscReady || pscMode != nxc::power::Mode::Close) {
+        nxc::log::breadcrumb("network disabled: psc_mode=close and successful PSC registration required");
+        return 0;
+    }
+    // 首次监听失败也走服务循环重试，不因一次临时网络错误退出模块。
+    const int listenFd = nxc::protocol::openListener();
     nxc::protocol::serveForever(listenFd, nxc::net::keepListenerOpen());
     return 0;
 }

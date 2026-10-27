@@ -3,6 +3,10 @@
 一个跑在主机上的 **sysmodule**，把能拿到的 NS 系统能力包成统一协议，
 给 PC 端 / AI 调用。**核心很小，能力全在工具里** —— 加一个能力 = 加一个工具文件，不改核心。
 
+当前维护架构、统一回归入口与验证边界见仓库根的 [MAINTAINING.md](../../MAINTAINING.md)。
+本文中带日期的实测记录仅说明当时构建，不代表后续版本已完成真机验收。
+`dist/exefs.nsp`保留主分支原有设备成品，与当前源码不同；新候选不随本次提交发布，详见[成品说明](dist/README.md)。
+
 ---
 
 ## 一、架构：核心 + 注册工具
@@ -13,11 +17,12 @@ device/platform/
 ├── config.json                  NPDM（权限、内存、syscall 表）
 ├── Makefile
 └── source/
-    ├── main.cpp                 入口：最小初始化 + 监听循环
+    ├── main.cpp                 入口：初始化 + 网络/睡眠循环 + 串行工作线程
     ├── core/                    ── 核心（不随功能增长）──
     │   ├── platform.hpp         核心内部接口
     │   ├── log.cpp              心跳 / 面包屑 / 内存环形日志
     │   ├── registry.cpp         工具注册表（遍历链接器收集到的段）
+    │   ├── jobs.hpp             有界任务队列、取消状态与连接代次
     │   └── protocol.cpp         行文本协议 + TCP 收发 + 分发
     └── tools/                   ── 工具（能力都在这里）──
         ├── tool_identify.cpp
@@ -34,7 +39,7 @@ device/platform/
 工具用 `NXC_DEFINE_TOOL` 把描述符放进一个叫 `nxc_tools` 的链接器段：
 
 ```cpp
-NXC_DEFINE_TOOL(nxc_tool_fs, "fs", "SD 卡文件（白名单内）", kMethods);
+NXC_DEFINE_TOOL(nxc_tool_fs, "fs", "SD 卡文件", kMethods);
 ```
 
 核心在启动时数一下这个段有多大，就知道有几个工具（`registry.cpp` 里用
@@ -93,15 +98,14 @@ ERR <码> <说明>\n    ← 不带载荷
 所以 `fs.ls` 回包里的名字（`visible%20tinted%20rocks_3002235272`）**原样拼回就能用**：
 带空格的路径从此是可寻址的（2026-10-05 修，背景见
 `docs/反馈-参数值含空格无法表达-20261005.md`）。
-★ **解码在所有工具看到路径之前完成** ⇒ 白名单 / `..` 检查拿到的是最终字节，不会被 `%2E%2E` 绕过。
+★ **解码在所有工具看到参数之前完成** ⇒ 路径与参数校验拿到的是最终字节。
 ★ 多字节 UTF-8（中文等）**不转义**，整串仍是合法 UTF-8。
-★ **PC 侧两个客户端会自动转义**（`pc/nxc.py`、MCP 的 `nxc_call`）——
-它们只转义"空格这类不可见字符"，所以日常写自然值就行：命令行里含空格的值请用引号，
-即 `python3 pc/nxc.py 'fs.ls path="/a b/c"'`；`%` 由调用方负责（字面的 `%` 写 `%25`）。
+★ **统一CLI和MCP会自动转义自然参数值**：例如 `./nxc call fs.ls 'path=/a b/c'`。
+字面的 `%` 自动变为 `%25`；手写协议的 `%20` 等转义只在 `./nxc call --raw '...'` 中原样保留。
 ★ 用 `nc` 手打协议行时**没有客户端帮忙**，得自己写 `%20`。
 ★ 大块二进制仍走 base64（字母表里没有空格与 `%`，不受影响）。
 
-### 核心内建的五条（不属于任何工具，永远存在）
+### 核心内建命令（不属于任何工具）
 
 | 命令 | 作用 |
 | --- | --- |
@@ -110,6 +114,7 @@ ERR <码> <说明>\n    ← 不带载荷
 | `help tool=<名字>` | 列出某个工具的全部方法（老接口，保留） |
 | ★★ **`tools.list`** | **能力发现**：一条命令拿到**全部工具 + 每个方法的使用摘要**（参数表、风险等级）。可选 `tool=<名>` 只看一个工具 |
 | ★★ **`tools.doc name=<工具[.方法]>`** | 取某个工具/方法的**完整教程**（作用/参数/示例/注意/返回/相关）；支持 `offset=`/`lines=` 分页 |
+| `cancel` | 从独立连接请求取消全部任务；已执行的修改不回滚，进行中的同步系统 IPC 无法强制打断 |
 
 ★ 为什么要有后两条：**AI 只能通过协议说话** —— 它读不到仓库里的 README。
 所以"这个平台能干什么、某个方法怎么用"必须**从设备里问得出来**，
@@ -120,7 +125,7 @@ ERR <码> <说明>\n    ← 不带载荷
 `NXC_DEFINE_TOOL_EX(..., 工具级教程)`。核心**不认识**任何工具，`tools.list`/`tools.doc` 只是汇总。
 详见 `source/tools/tool_fs.cpp` 末尾的样板。
 ★ 老写法 `NXC_DEFINE_TOOL(..., kMethods)` 与"方法表里只写三项"**仍然有效**
-（新字段都带默认值）⇒ 可以逐个方法慢慢补，不会一次性逼你改完 54 处。
+（新字段都带默认值）⇒ 可以逐个方法补齐，不必一次性修改全部方法。
 
 ### 手工试一下（不需要写客户端）
 
@@ -165,6 +170,7 @@ NXC_DEFINE_TOOL(nxc_tool_echo, "echo", "示例工具", kMethods);
 | `host::toolCount()` | 已注册工具数 |
 | `host::heartbeatPath()` | 心跳文件路径 |
 | `host::dumpLog(reply, n)` | 把环形日志写进应答 |
+| `host::operationCancelled()` | 检查当前任务是否因断线、睡眠或显式取消而停止；耗时循环需主动检查 |
 
 ---
 
@@ -174,13 +180,18 @@ NXC_DEFINE_TOOL(nxc_tool_echo, "echo", "示例工具", kMethods);
 | --- | --- | --- |
 | `identify` | `id` | 平台/固件版本、开机次数、工具数 |
 | `log` | `dump` `info` | 取走内存环形日志 |
-| `fs` | `roots` `ls` `stat` `read` `write` `copy` `mkdir` `rm` | SD 卡文件，**白名单内**（含平台的自我更新） |
+| `fs` | `roots` `ls` `stat` `read` `write` `copy` `rename` `mkdir` `rm` | SD 卡绝对路径；目录可分页，文件可暂存后提交 |
 | `probe` | `list` `try` `group` `results` | ★ 能力探针：逐个试系统服务，产出能力矩阵 |
 | `tele` | `freq` `temp` `battery` `perf` `all` | 主机遥测：频率 / 温度 / 电池 / 性能模式 |
 | `clk` | `list` `get` `set` `restore` | CPU/GPU/MEM 频率，**带原值回滚** |
 | `power` | `status` `reboot` `shutdown` | 电源。重启/关机**必须带确认口令**，可选 `via=bpc\|spsm` |
-| `title` | `list` `current` `name` | 主机上「有什么、在跑什么」（只读） |
+| `title` | `list` `current` `name` `processes` `launch` `terminate` | 应用查询与显式启动/结束；普通启动有固件版本限制 |
 | `mem` | `info` `read` `peek` `write` | ★ **读写运行中游戏的内存（不冻结游戏）**。与 GDB 互斥，见下 |
+| `screen` | `info` `capture` `wait_change` `wait_stable` | JPEG 截图、等画面变化或稳定 |
+| `input` | `status` `press` `release` `seq` `detach` | 虚拟手柄与输入序列 |
+| `net` | `info` `probe` `deps` | 网络与外部依赖诊断 |
+| `save` | `list` `backup` `verify` `restore` | 明确存档身份、独立备份与清单校验；恢复需口令且目标应用已关闭 |
+| `boot` | `list` `status` `set` | Hekate 启动项 |
 
 ### ★★ `mem` 与 PC 侧 GDB 互斥 —— AI 必须二选一
 
@@ -275,18 +286,21 @@ title.current（读完之后再查一次） → 应用仍在跑（pid 未变）�
 
 ### `title`：主机上有什么、在跑什么
 
-| 方法 | 说明 | 依赖的服务（均已实测可用） |
+| 方法 | 说明 | 依赖的服务与限制 |
 | --- | --- | --- |
 | `title.list [count=] [offset=]` | 已安装应用列表（`application_id` + 最后更新时间） | `ns` |
 | `title.current` | 当前在跑什么（应用进程 id → `program_id`；没在跑返回 `running=none`） | `pm:dmnt` |
 | `title.name app=<id>` | 读 NACP 拿应用名 / 作者 / 版本号 | `ns` |
 | `title.processes` | 列出正在跑的进程（pid + program_id）—— 决定"关哪个"之前先看它 | `pm:dmnt` |
-| ★ `title.launch app=<id> [storage=] confirm=I-KNOW-THIS-LAUNCHES` | **启动应用**（`storage` 默认 `any`，让系统自己找） | `pm:shell` 的 `pmshellLaunchProgram` |
+| ★ `title.launch app=<id> [storage=] confirm=I-KNOW-THIS-LAUNCHES` | 普通应用默认 `mode=application`，`storage` 默认 `any` | `nsdevLaunchApplicationWithStorageIdForDevelop`，仅固件 `1.0.0..17.0.1`，尚未真机验收 |
 | ★ `title.terminate app=<id>\|pid=<n> confirm=I-KNOW-THIS-CLOSES` | **结束应用** | `pm:shell` 的 `pmshellTerminateProcess` |
 
 ★ 启动/结束都要**确认口令**，而且 `title.terminate` 会**丢失未保存进度**（help 里写明了）。
 `title.launch` 的 `storage` 取 `any`（默认）/ `sd` / `user` / `system` / `gc`——
 默认走 `any` 是有意的：CFW 上应用可能装在 SD 也可能在 NAND，写死一个反而会失败。
+当前固件 `22.5.0` 或未知版本的默认普通应用启动请求会返回 `409 application-launch-unsupported`，
+不猜测未公开 IPC，也不自动调用其他启动接口。显式 `mode=applet|program|libapplet` 仍属实验接口。
+关闭应用后可能出现系统提示框；统一入口调用 `title.terminate` 后不会自动按键，须截图并由用户确认下一步。
 
 **2026-10-05 真机验收（走 MCP 工具真实调用）**：
 
@@ -306,10 +320,9 @@ title.name app=0x010021C000B6A000     → <应用名> / <发行商> / 1.7.9b
 
 | 工具 | 做法 | 状态 |
 | --- | --- | --- |
-| `title.launch` / `title.terminate` | `pmshellLaunchProgram` / `pmshellTerminateProcess` | 🔜 会改变主机状态，要单独设计确认流程与验证时机 |
 | `gdb` | **设备侧当 GDB 客户端**，连 `127.0.0.1:22225`，把断点/读内存转成平台方法 | 🔜 好处：PC 只连平台一个端口。代价：要自己实现 GDB 的 RSP 协议；且与 `dmnt` 互斥 |
 | `net.ftp` | 让平台自己变成 FTP 服务端，老工具链可直连 | 🔜 只有当"外部工具必须用 FTP"时才值得做；`fs.*` 已覆盖大部分需求 |
-| 抓画面 | 走 SysDVR（它本身就是 sysmodule） | 🔜 属添头；注意 `caps:u`/`caps:su` 实测打不开，所以不能走截图服务 |
+| 抓画面 | 已实现 `screen.capture`，使用 capssc JPEG 接口及调试命令 | 见 `screen` 的动态教程；不依赖 SysDVR |
 
 ### 遥测读数从哪来（`tele`）
 
@@ -325,28 +338,27 @@ title.name app=0x010021C000B6A000     → <应用名> / <发行商> / 1.7.9b
 
 | 操作 | 保护 |
 | --- | --- |
-| `fs.write` | 路径白名单（`/config/nxc`、`/switch`、**平台自己的模块目录**），路径含 `..` 拒绝 |
+| `fs.write` | SD 卡绝对路径；允许空文件须显式 `allow_empty=1`。设备不提供 NAND 访问 |
 | `clk.set` | **先读原值再写**；读不到原值就**拒绝设置**（`409`）；可用 `clk.restore` 还原。★ 原值只存在内存里，模块重启即丢 |
 | `power.reboot` | 必须带 `confirm=I-KNOW-THIS-REBOOTS` |
 | `power.shutdown` | 必须带 `confirm=I-KNOW-THIS-SHUTS-DOWN` |
 | `title.launch` | 必须带 `confirm=I-KNOW-THIS-LAUNCHES` |
 | `title.terminate` | 必须带 `confirm=I-KNOW-THIS-CLOSES`（会丢未保存进度） |
 | `mem.write` | 必须带 `confirm=I-KNOW-THIS-WRITES-MEMORY`（可能损坏存档） |
+| `save.restore` | 必须带 `confirm=RESTORE_SAVE`；完整验证备份及目标身份，并确认目标应用未运行 |
 
-### ★ `fs` 白名单的第三个根：平台的自我更新
+### 平台的自我更新
 
-白名单第 3 个根是 **`/atmosphere/contents/4200000000000012`** —— 也就是平台自己的模块目录。
-加它的理由很实际：**此前每次更新模块都要"退游戏 → 开 hbmenu → 开 ftpd → 上传 → 重启"，
-一环都不能少；有了它，平台可以自己覆盖自己的 `exefs.nsp`，之后只要重启就行。**
-
-代价要说清楚：**写坏了自己，下次开机模块加载失败 —— 拔卡删掉目录即可复原。**
-
-配套动作：
-* 写进这个根的会被记成 **`fs.write SELF-UPDATE …`** 面包屑（比普通写入更醒目），
-  便于"写坏了回溯到底写了什么、多大"。
-* 新增 **`fs.copy src= dst=`** —— 自我更新前先把旧的 `exefs.nsp` 备份成 `exefs.nsp.bak`。
-* 这个根**没有**确认口令：它保护的是平台自己（可恢复），不是用户数据，加口令只会给
-  分块上传（130KB 要拆很多次）添无意义的摩擦。
+平台模块路径为 `/atmosphere/contents/4200000000000012/exefs.nsp`。
+MCP 的 `nxc_deploy` 和 `nxc_put` 默认通过统一后台选择文件通道。使用 fs 通道时，
+先上传到同目录暂存文件并完整核验；目标已存在时先备份并核验旧内容，
+最后通过 `fs.rename replace=1 rollback=<新路径>` 提交：
+旧目标移到回滚路径，再移入暂存文件；第二步失败尝试恢复旧目标，回滚失败明确回报路径。
+设备文件系统不支持覆盖式原子重命名，切换中仍有掉电窗口；备份与回滚文件均保留。
+校验失败返回 MCP 错误；旧设备缺少 fs 提交原语时拒绝该通道上传。
+旧设备可通过可用的 FTP 服务在线更新，后台负责暂存、摘要核验、备份和重命名提交；
+无可用 FTP 且缺少 fs 提交原语时才需离线更新。
+直接调用 `fs.write` 仍是普通原地写入，不能当作事务部署替代。
 
 ★ **重启/关机是调研时的意外收获**：`bpc` 服务自带 `bpcRebootSystem()` / `bpcShutdownSystem()`，
 而 `bpc` 在 M1 探针里初始化成功 ⇒ **不必等 `spsm`**。（开工单曾断言"真正的 reboot 要 `spsmShutdown`，
@@ -382,50 +394,38 @@ title.name app=0x010021C000B6A000     → <应用名> / <发行商> / 1.7.9b
   **从未挂 `bis:`**。⇒ 想动内部储存，本平台做不到。
 * ★ **写入留痕仍在**：两类写入会单独写一条更醒目的面包屑 —— 写自己的模块目录（= **自我更新**）
   与写 `/bootloader`（= **影响下次开机落点**），方便事后回溯"是谁改的"。
-* **动作类方法要确认口令**（6 个）：`mem.write` · `title.launch` · `title.terminate` ·
-  `boot.set` · `power.reboot` · `power.shutdown`，各自要一个显式的 `confirm=` 串。
+* **需确认的方法**：`mem.write` · `title.launch` · `title.terminate` ·
+  `boot.set` · `power.reboot` · `power.shutdown` · `save.restore`，各自要一个显式的 `confirm=` 串。
   ★ `clk.set` 不走口令，它的保护是"**先记原值，读不到原值就拒设**"。
   `fs.write` / `fs.rm` / `save.backup` 这类"只动 SD"的不要口令，但会留痕。
 * ★ **`flags/boot2.flag` 必须加**（早期"不加"的说法已被真机实测推翻，理由见第七节）：
   不加的结果**不是**"换个阶段加载"，而是**模块根本不会被加载**。
 * 启动路径上只写一行面包屑，不做重 IO。
-* 只开一个端口（`47800`）。
+* 设备模块只开一个端口（`47800`）；PC后台使用本机回环端口`47801`。
 * ★ **`nv`（GPU 驱动）是禁区**：实测一调就把模块搞死。已在 `tool_probe.cpp` 标 `KNOWN-FATAL`。
 
 ---
 
 ## 六·五、PC 侧接入：一个 MCP 入口，不是「每个工具一个 MCP 工具」
 
-`pc/nxc_mcp.py` 是 PC 侧的 MCP 服务器（stdio）。它的设计原则是
-**和设备侧同构：核心 + 动态发现**，**绝不为每个设备工具硬写一个 MCP 工具**。
+`./nxc mcp` 是stdio MCP入口，代理到统一PC后台。CLI、Web和MCP共享后台拥有的设备连接与GDB会话，
+正式实现位于 `pc/src/nxc_host/`。本机Web入口是 `./nxc web`，默认 `http://127.0.0.1:47801`。
 
 ```
-nxc_caps   ← 动态发现：连上设备问「你现在有哪些工具、每个工具有什么方法」
-nxc_call   ← 唯一执行入口：method="<工具>.<方法>"，params={...}
-nxc_gdb    ← PC 侧完整 GDB（断点/单步/调用栈/反汇编）。★ 与 nxc_call 的 mem.* 互斥
+nxc_caps   ← 动态发现设备工具与参数
+nxc_call   ← 通用设备方法执行
+nxc_gdb    ← 统一后台持有的完整GDB会话
+nxc_put / nxc_fetch / nxc_deploy / nxc_see / nxc_step ← 传输、发布和画面编排
 ```
 
-**前两个是设备侧平台的入口，永远不变。** 设备上加工具 ⇒ 它们一个字都不用改，
-AI 先 `nxc_caps` 拿清单再 `nxc_call` 调用即可。
-
-**第三个（`nxc_gdb`）是个例外，而且是刻意的**：GDB 不在设备侧 —— 它跑在 PC 侧的
-devkitPro 容器里（`aarch64-none-elf-gdb`，连 22225）。理由见
-本机开发记录 §十九：
-设备侧重造只会得到一个更弱的子集，还会引入平台里第一个"有状态"的东西。
-
-★ **`mem.*` 与 `nxc_gdb` 二选一**（抢同一个调试能力，同时用崩机）：
-
-| 想做的事 | 用哪个 |
-| --- | --- |
-| 不冻结地持续读游戏内存（常驻观察） | `nxc_call` 的 `mem.*` |
-| 停下来调试（断点 / 调用栈 / 单步） | `nxc_gdb` |
-
-`nxc_gdb` 的用法：`action=open` 开会话（`connect=true` 会连上并停住目标）→
-`action=run` 发 gdb 命令 → `action=close` 关会话 → `action=status` 看状态。
-
+GDB优先使用本机或明确指定的可执行文件，自动模式也可使用已有Docker镜像；不会自动安装或拉取。
+`./nxc doctor`报告实际后端。`./nxc gdb attach`可查询当前应用、按需开GDB并附加，
+也可先 `open` 再显式按PID附加；连接调试桩与附加目标是不同状态。
+`run`支持命令执行，`continue`即时返回运行状态，`status`读取异步事件；`detach`释放目标，`close`回收会话。
+已连接或执行结果未知时，后台拒绝独立 `mem.*` 操作，须先确认分离或关闭。
 
 为什么不在 MCP 侧给每个设备工具建一个包装：那会造成**双向耦合**（设备改一次、PC 改一次），
-两边清单还会各自漂移。当前设计下设备侧的 **14 个工具 / 54 个方法**全部通过这 2 个入口可达
+两边清单还会各自漂移。当前设计下设备侧的 **14 个工具 / 59 个方法**全部通过这 2 个入口可达
 （★ 2026-10-06 更正：这里原来写"7 个工具 / 27 个方法"，是早期数字；**准确值以设备自己回的
 `caps` 为准**，别手抄）。
 
@@ -433,8 +433,8 @@ devkitPro 容器里（`aarch64-none-elf-gdb`，连 22225）。理由见
 这台主机的 TCP 栈对「频繁建连/断连」敏感（FTP 那边有同样的毛病）——
 实测每次新建连接时 `clk.get` 会偶发 `ConnectionResetError`，改成长连接后消失。
 
-★ **重试策略（安全优先）**：只在**一条响应都还没收到**时才重连重试一次；
-一旦读到过部分响应就直接抛出，**绝不重放**，避免重复执行写操作。
+★ **重试策略**：只有调用点明确标记为可重试的只读请求才会重连重试一次。
+写入、按键、重启等操作即使没有收到响应也不会重放；连接中断表示结果未知，调用方须先查状态。
 
 ### 让 AI 真的能调（任何支持 MCP 的客户端）
 
@@ -444,9 +444,8 @@ devkitPro 容器里（`aarch64-none-elf-gdb`，连 22225）。理由见
 {
   "mcpServers": {
     "nxc": {
-      "command": "<python3 绝对路径>",
-      "args": ["<本仓库路径>/pc/nxc_mcp.py"],
-      "env": { "NXC_DEVICE_IP": "<设备IP>", "NXC_DEVICE_PORT": "47800" }
+      "command": "<仓库根目录或运行包的nxc绝对路径>",
+      "args": ["mcp"]
     }
   }
 }
@@ -462,7 +461,7 @@ printf '%s\n' \
  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}' \
  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nxc_call","arguments":{"method":"tele.all"}}}' \
- | python3 pc/nxc_mcp.py
+ | ./nxc mcp
 ```
 
 ---
@@ -480,8 +479,8 @@ printf '%s\n' \
 | ★ `__appInit` 开头 `svcSleepThread(20s)` 等系统就绪 | ⚠️ 换成"在 main 里有上限地重试" | 目的相同（boot2 阶段 `bsd:u` 未就绪），我们的方式不阻塞启动 |
 | 堆 4.5 MB（`HEAP_SIZE 0x00480000`） | ❌ 保留 512 KB | 官方模板是 512 KB；我们的 `Args`/`Reply` 都是静态，堆只给 libnx 内部用 |
 | ★ `dup2(clientFd, STDOUT_FILENO)` 把 stdout 接到客户端 | 🔜 待做 | **解决"sysmodule 没有 stdout"**：之后工具的 `printf` 会直接发到客户端 |
-| `poll()` 多客户端 accept 循环 | 🔜 待做（首期是单客户端阻塞式） | 多个 PC 程序同时连时才需要 |
-| 用 `threadCreate/threadStart` | 首期单线程 | 我们的设计不需要多线程 |
+| `poll()` 多客户端 accept 循环 | 已实现 | 网络循环负责监听、接入和有界发送 |
+| 用 `threadCreate/threadStart` | 已实现 | 工具命令由单个工作线程串行执行，网络/睡眠循环独立运行 |
 | `toolbox.json` 放模块目录 | ✅ 已加 | 模块会出现在 **sysmodules 工具箱/覆盖层**里，可开关，不必手改文件 |
 
 ★ 另一条关键旁证：**sys-botbase 在 `__appInit` 里对初始化失败直接 `fatalThrow`，却被大量玩家日常使用** ——
@@ -523,11 +522,17 @@ printf '%s\n' \
 
 ```bash
 # 构建（本机没有 devkitPro，走 docker）
-docker run --rm -v "$PWD":/work -w /work devkitpro/devkita64:latest \
+docker run --rm -v "$PWD":/work -w /work/device/platform \
+  devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282 \
   bash -lc '. /opt/devkitpro/devkita64.sh && make -j4'
 ```
 
 因为工程里有 `config.json`，产出的是 **ExeFS PFS0（`nxc.nsp`）** 而不是 `.nro`。
+以上命令在仓库根目录执行；离线回归入口为 `python3 tests/run_checks.py`。
+
+首次安装除 `exefs.nsp` 和 `flags/boot2.flag` 外，还须复制发行目录的 `config/nxc/` 到 SD 卡 `/config/nxc/`：
+`net_mode.txt` 内容为 `listen`，`psc_mode.txt` 内容为 `close`。
+没有网络配置时源码默认 `off`，不会出现 `47800`；`close` 配合系统睡眠关闭连接、唤醒恢复监听。
 
 **★ 部署顺序（2026-10-06 修订：先核对、再留底、后上传）**
 
@@ -543,7 +548,7 @@ nc -z <设备IP> 47800
 #    nxc_call fs.copy src=/atmosphere/contents/4200000000000012/exefs.nsp \
 #                     dst=/config/nxc/_prev-exefs-<时间>-<旧哈希前8位>.nsp
 
-# 3) 上传：走 MCP 的 nxc_deploy（47800 的 fs.write 分块写，自带读回 sha256 校验）
+# 3) 上传：走 MCP 的 nxc_deploy（暂存上传、完整读回校验、旧文件备份、rename 提交）
 #    ★ 不需要 FTP、不需要拔卡；它必须回 verified=true 才算成功。
 #    备选（47800 不通时）：FTP 5000，账号 <用户>/<密码>，用 curl 传
 #    ★ 老文档里的 tools/device_ftp.py 并不存在。
@@ -558,16 +563,15 @@ nc -z <设备IP> 47800
 #      TCP 照样能被 accept（backlog 收下三次握手），而 identify.id **不回话**
 #      ⇒ 只看"端口通"会误判成"已经起来了"，紧接着读开机号失败，报成"检测不到"。
 #      （另一个坑：人工在 Hekate 菜单里选一项可能要 30~50 秒，短窗口经常等不到。）
-#    推荐直接用项目自带的等待工具：按开机号判断、把三种状态分开报、
-#    超时后还会去 ARP 表里找设备（防 DHCP 换 IP）：
-python3 pc/nxc_wait_boot.py            # 先读当前开机号，然后等它 +1
-python3 pc/nxc_wait_boot.py --once     # 只想看一眼现在处于哪一态
+#    统一命令轮询配置目标的开机号；地址变化时先在Web或配置中确认新IP：
+./nxc boot            # 先读当前开机号，然后等它 +1
+./nxc boot --once     # 只想看一眼现在处于哪一态
 #    手工版（能用，但要知道上面那个坑）：
 printf 'identify.id\n' | nc <设备IP> 47800     # boot 应该 +1
 
 # 5b) 核对【卡上那份】到底是哪一版（部署前核对、部署后复查都用它）：
-python3 pc/nxc_remote_sha.py /atmosphere/contents/4200000000000012/exefs.nsp \
-    --compare-local dist/exefs.nsp     # 卡上 / 本地 / 期望值 三方比对
+./nxc sha /atmosphere/contents/4200000000000012/exefs.nsp
+shasum -a 256 device/platform/dist/exefs.nsp   # 与上面的远端SHA256核对
 ```
 
 **6) 部署后看这两个文件**（证明模块真的被加载了）：
@@ -590,7 +594,7 @@ printf 'hello\nidentify.id\n' | nc <设备IP> 47800
 | 心跳文件没出现 **且** 端口不通 **且** `/atmosphere/fatal_errors/` 不存在 | **没被加载** ⇒ 先查 `flags/boot2.flag` 在不在，再查目录名与 NPDM 的 `program_id` 是否一致 |
 | 心跳文件出现、但端口不通 | 加载了但卡在 `main` ⇒ 看**面包屑文件的最后一行** |
 | 出现 `/atmosphere/fatal_errors/*.bin` | 崩了。boot2 阶段的崩溃可能表现为**开机致命错误** |
-4. 拔掉模块（删掉 `/atmosphere/contents/4200000000000012/`）即可完全回到原状 —— 我们**没有**放任何 `flags/`。
+停用模块可删除 `flags/boot2.flag`，或移走 `/atmosphere/contents/4200000000000012/`。
 
 
 ### 2026-10-05 实测记录（本机 docker，全部可复核）

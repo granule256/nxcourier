@@ -1,10 +1,8 @@
 # ================================================================
 # NxCourier —— 仓库排除规则
 #
-# 原则：**仓库里只留「产品本身」——
-#       源码 + README + 要留档的成品**；
-#       开发过程材料、测试脚本、只对本机有意义的东西一律不入库
-#       （它们仍然留在磁盘上，只是不被 git 跟踪）。
+# 原则：源码、可复用测试、维护说明及发行成品入库；
+#       现场取证、一次性过程记录、构建缓存与本机材料不入库。
 #
 # ★ 注意：带 `/` 前缀的规则才锚定在仓库根；不写会匹配任意层级同名目录。
 # ================================================================
@@ -13,16 +11,17 @@
 #   docs/ 是过程记录（交接报告、需求分析、开工单、原始回包日志、改动日志…）。
 #   ★ 想让某篇文档进仓库：把它挪到 docs/ 之外，或删掉下面这行。
 /docs/
-#   tests/ 是宿主侧单测与门禁、dead-end/ 是没走通的废弃方案 —— 都不属于产品。
-device/platform/tests/
+#   宿主测试属于可维护工程的一部分，tests/、pc/tests/、device/platform/tests/ 均入库。
+#   dead-end/ 是没走通的废弃方案。
 device/platform/dead-end/
 
-# ---- 测试 / 一次性验收脚本（不是产品功能）----
-pc/nxc_accept_space_fix.py
-pc/nxc_codec_check.py
-pc/nxc_mcp_selftest.py
-pc/nxc_mcp_deadconn_test.py
-pc/nxc_nvnflinger_cmu.py
+# ---- 一次性现场诊断或已过期的测试；精确匹配，不屏蔽通用测试目录 ----
+pc/tests/manual/nxc_accept_space_fix.py
+pc/tests/manual/nxc_codec_check.py
+pc/tests/manual/nxc_mcp_selftest.py
+pc/tests/manual/nxc_nvnflinger_cmu.py
+device/platform/tests/test_poll_wait.py
+device/platform/tests/decode_line.cpp
 
 # ---- 本机现场材料 ----
 #   事故取证留档（崩溃转储、系统模块日志）、救急包、下载物、临时目录。
@@ -33,9 +32,11 @@ pc/nxc_nvnflinger_cmu.py
 
 # ---- 本机工具目录（工作记录、本机技能定义等，只对本机有意义）----
 /.workbuddy/
+/.superpowers/
 
 # ---- 构建中间产物（都能重新生成）----
 device/platform/build/
+device/platform/build-*/
 device/platform/nxc.elf
 device/platform/nxc.nso
 device/platform/nxc.nsp
@@ -64,3 +65,8 @@ __pycache__/
 *~
 .idea/
 .vscode/
+
+# PC应用构建输出（可用build_app.py重建）
+/pc/dist/
+/pc/*.egg-info/
+/pc/src/*.egg-info/

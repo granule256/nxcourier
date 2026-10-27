@@ -25,6 +25,7 @@ def function(signature):
 
 harness = r'''
 #include <poll.h>
+#include <atomic>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -84,11 +85,16 @@ int sleepEventCount() { return 0; }
 }
 namespace protocol {
 constexpr int kMaxClients=4, kRequestBytes=8192;
-struct Client { int fd=-1, len=0; bool dropping=false; char line[kRequestBytes]; };
+struct Client { int fd=-1, len=0; bool dropping=false, readClosed=false; uint64_t generation=0; char line[kRequestBytes]; };
 Client g_clients[kMaxClients];
 int activeClientCount() { int n=0; for(auto& c:g_clients) if(c.fd>=0) ++n; return n; }
 bool sendAll(int, const char*, int) { return true; }
-bool handleLine(int, char*, bool) { return true; }
+bool startWorker() { return true; }
+struct Work { void cancelAll() {} bool hasClient(int,uint64_t){return false;} bool hasWork(){return false;} } g_work;
+std::atomic<int> g_networkOperations{0};
+void flushResponses() {}
+void closeClient(int slot) { if(g_clients[slot].fd>=0) fake_close(g_clients[slot].fd); g_clients[slot].fd=-1; }
+bool submitLine(int, char*, bool) { return true; }
 '''
 
 macros = '''
@@ -143,5 +149,5 @@ with tempfile.TemporaryDirectory(prefix='nxc-listener-test-') as temp:
     cpp = temp / 'listener.cpp'
     cpp.write_text(harness + macros + function('int openListener() {') + '\n' + function('void serveForever(int listenFd, bool keepListenerOpen) {') + '\n' + tests)
     binary = temp / 'listener-test'
-    subprocess.run(['clang++', '-std=c++17', '-Wall', '-Wextra', str(cpp), '-o', str(binary)], check=True)
+    subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', str(cpp), '-o', str(binary)], check=True)
     raise SystemExit(subprocess.run([str(binary)]).returncode)

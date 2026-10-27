@@ -20,10 +20,10 @@
 
 ## 用法
 
-    python3 pc/nxc_remote_sha.py /atmosphere/contents/4200000000000012/exefs.nsp
-    python3 pc/nxc_remote_sha.py <路径> --expect 5ee6c2be…   # 顺手比对，不一致就退出码 1
+    PYTHONPATH=pc/src python3 -m nxc_host.remote_sha /atmosphere/contents/4200000000000012/exefs.nsp
+    PYTHONPATH=pc/src python3 -m nxc_host.remote_sha <路径> --expect 5ee6c2be…   # 顺手比对，不一致就退出码 1
     # 本地文件也打一份对照（方便直接比）
-    python3 pc/nxc_remote_sha.py <路径> --compare-local dist/exefs.nsp
+    PYTHONPATH=pc/src python3 -m nxc_host.remote_sha <路径> --compare-local dist/exefs.nsp
 """
 from __future__ import annotations
 

@@ -1,0 +1,13 @@
+[project]
+name = "nxc-host"
+dynamic = ["version"]
+description = "NXC PC 统一后台与 CLI/MCP 入口"
+requires-python = ">=3.10"
+license = "GPL-2.0-only"
+dependencies = []
+
+[project.scripts]
+nxc = "nxc_host.cli:main"
+
+# 本项目直接从源码运行或由 build_app.py 使用标准库 zipapp 构建。
+# 不要求安装构建后端；版本单一来源为仓库根目录 VERSION。

@@ -305,7 +305,7 @@ void cmdWaitChange(const nxc::Args& a, nxc::Reply& r) {
     u64 lastHash = baselineHash;
 
     for (;;) {
-        svcSleepThread(static_cast<u64>(intervalMs) * 1000000ULL);
+        if (!nxc::host::sleepMilliseconds(static_cast<unsigned long long>(intervalMs))) break;
 
         u64 size = 0;
         if (R_FAILED(captureInto(buf, bufBytes, &size, 3000, layer, &via))) break;
@@ -319,6 +319,7 @@ void cmdWaitChange(const nxc::Args& a, nxc::Reply& r) {
     }
 
     std::free(buf);
+    if (nxc::host::operationCancelled()) { r.fail(409, "operation-cancelled"); return; }
 
     nxc::host::log("screen.wait_change: changed=%d frames=%d elapsed=%lldms",
                    changed ? 1 : 0, frames, elapsedMs);
@@ -415,10 +416,11 @@ void cmdWaitStable(const nxc::Args& a, nxc::Reply& r) {
         havePrev = true;
 
         if (elapsedMs >= timeoutMs) break;
-        svcSleepThread(static_cast<u64>(intervalMs) * 1000000ULL);
+        if (!nxc::host::sleepMilliseconds(static_cast<unsigned long long>(intervalMs))) break;
     }
 
     std::free(buf);
+    if (nxc::host::operationCancelled()) { r.fail(409, "operation-cancelled"); return; }
 
     nxc::host::log("screen.wait_stable: stable=%d frames=%d held=%d elapsed=%lldms",
                    stable ? 1 : 0, frames, held, elapsedMs);

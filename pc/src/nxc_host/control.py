@@ -9,24 +9,21 @@
 
 """NxCourier 控制小工具 —— 把「截图 / 按键 / 摇杆」做成一条命令，方便一步步看着屏幕走。
 
-    python3 pc/nxc_ctl.py shot [名字]          截图并取回本机 tmp/<名字>.jpg（默认 step）
-    python3 pc/nxc_ctl.py press A,B [hold_ms]  按键（多个用逗号分隔）
-    python3 pc/nxc_ctl.py stick lx ly [hold_ms]  左摇杆（中心 0，满偏 ±32767）
-    python3 pc/nxc_ctl.py wait 秒              等待
-    python3 pc/nxc_ctl.py current              看当前在跑什么
-    python3 pc/nxc_ctl.py close [pid]          ★ 直接关闭应用，并自动按掉系统错误框
-    python3 pc/nxc_ctl.py act "步骤" [--stable]  ★★ 按一串键 → 等画面反应（边看边控制的核心）
+    PYTHONPATH=pc/src python3 -m nxc_host.control shot [名字]          截图并取回本机 tmp/<名字>.jpg（默认 step）
+    PYTHONPATH=pc/src python3 -m nxc_host.control press A,B [hold_ms]  按键（多个用逗号分隔）
+    PYTHONPATH=pc/src python3 -m nxc_host.control stick lx ly [hold_ms]  左摇杆（中心 0，满偏 ±32767）
+    PYTHONPATH=pc/src python3 -m nxc_host.control wait 秒              等待
+    PYTHONPATH=pc/src python3 -m nxc_host.control current              看当前在跑什么
+    PYTHONPATH=pc/src python3 -m nxc_host.control close [pid]          直接关闭应用；用户判图后决定是否按键
+    PYTHONPATH=pc/src python3 -m nxc_host.control act "步骤" [--stable]  ★★ 按一串键 → 等画面反应（边看边控制的核心）
                                                步骤写法同 input.seq：DRIGHT:120;WAIT:300;A:120
                                                默认等「画面变了」；--stable 等「画面停住」
 
 为什么单独做个脚本：**"看着屏幕操作"需要反复 截图→看→按键**，
 把它压缩成一条命令，每一步的往返成本才低。
 
-★ `close` 为什么是"两步"：`title.terminate` 强制终止任何应用，
-系统**一定**会弹「由于发生错误，软件已关闭。」（实测
-`pmshellTerminateProcess` 与 `pmshellTerminateProgram` 两种模式都一样）。
-所以"关得干净"要靠**再按一次 A 把框按掉** —— 关闭本身仍然是直接从进程层做的，
-不是走菜单操作。
+`close` 只发送关闭请求，不会自动按键。系统可能显示提示框；
+请先截图查看，由用户明确确认当前画面和下一步操作后再执行输入。
 """
 from __future__ import annotations
 
@@ -35,11 +32,10 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-import nxc_mcp  # noqa: E402
+from . import tools as nxc_mcp
 
 DEVICE = nxc_mcp.Device(os.environ.get("NXC_DEVICE_IP", "192.168.1.50"), 47800, 60.0)
-OUTDIR = Path(__file__).resolve().parent.parent / "tmp"
+OUTDIR = Path.cwd() / "tmp"
 
 
 def shot(name: str = "step") -> None:
@@ -67,37 +63,31 @@ def stick(lx: int, ly: int, hold_ms: int = 400) -> None:
     print(result.get("payload", result))
 
 
-def _screen_bytes() -> int:
-    """抓一张图，只回报字节数 —— 用来判断"现在是不是还停在错误框上"。
-
-    依据：实测那张「由于发生错误，软件已关闭。」的框只有约 37KB，
-    而正常主界面约 188KB、游戏画面 150～370KB。所以尺寸是个可靠的判据。
-    """
-    result = nxc_mcp.tool_call(DEVICE, {"method": "screen.capture"})
-    if "error" in result:
-        return 0
-    return int(result["payload"][0]["bytes"])
-
-
-def close(pid: int | None = None, dismiss: bool = True) -> None:
-    """直接关闭正在跑的应用，并（默认）自动按掉系统错误框。
-
-    ★ 为什么必须"关 + 按框"两步：强制终止任何应用，系统**一定**会弹
-      「由于发生错误，软件已关闭。」—— 实测 `pmshellTerminateProcess` 与
-      `pmshellTerminateProgram`（`mode=process` / `mode=program`）都一样。
-      关闭动作本身仍是直接调 `title.terminate`，**不是走菜单操作**。
-
-    ★ 为什么不能简单"等一下再按一次 A"：实测按早了没用 ——
-      **框是在进程真正死掉之后才弹出来的**，时间点不好猜。
-      所以这里**轮询检测**：抓图看尺寸，确认框已经出现才按 A，按完再确认它没了。
-      （盲按多次 A 是危险的：主界面上多按一次 A 会直接把游戏启动起来。）
-    """
+def close(pid: int | None = None) -> None:
+    """关闭应用后由用户判图；不根据 JPEG 大小推断界面内容。"""
     if pid is None:
-        cur = nxc_mcp.tool_call(DEVICE, {"method": "title.current"}).get("payload", [{}])[0]
-        if cur.get("running") != "application":
+        result = nxc_mcp.tool_call(DEVICE, {"method": "title.current"})
+        if "error" in result:
+            print("查询当前应用失败:", result["error"])
+            return
+        payload = result.get("payload")
+        if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+            print("查询当前应用失败: 响应缺少应用状态", result)
+            return
+        cur = payload[0]
+        if cur.get("running") == "none":
             print("当前没有应用在跑，不用关")
             return
-        pid = int(cur["pid"])
+        if cur.get("running") != "application":
+            print("查询当前应用失败: 无法识别应用状态", cur)
+            return
+        try:
+            pid = int(cur["pid"])
+            if pid <= 0:
+                raise ValueError("pid 必须为正数")
+        except (KeyError, TypeError, ValueError):
+            print("查询当前应用失败: 响应缺少有效进程号", cur)
+            return
 
     result = nxc_mcp.tool_call(DEVICE, {"method": "title.terminate",
                                         "params": {"pid": pid,
@@ -106,21 +96,8 @@ def close(pid: int | None = None, dismiss: bool = True) -> None:
     if "error" in result:
         return
 
-    if not dismiss:
-        return
-
-    # 轮询：等框出现 → 按 A → 确认它没了。
-    for attempt in range(1, 7):
-        time.sleep(2.0)
-        size = _screen_bytes()
-        if size == 0:
-            continue
-        if size > 60000:
-            print(f"界面已恢复正常（画面 {size}B，第 {attempt} 次检查）—— 提示框已关掉")
-            return
-        print(f"  第 {attempt} 次：检测到提示框（{size}B），按 A 关闭")
-        press("A", 150)
-    print("警告：重试 6 次仍未恢复，请人工看一眼屏幕")
+    print("关闭请求已返回。系统可能显示提示框，请先执行 shot 查看截图；"
+          "由用户明确确认当前画面和下一步按键后，再执行 press。")
 
 
 def act(steps: str, timeout_ms: int = 5000, stable: bool = False) -> None:

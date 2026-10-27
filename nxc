@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""NXC 源码树入口；发行运行包由 pc/build_app.py 构建。"""
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "pc/src"))
+from nxc_host.cli import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

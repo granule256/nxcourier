@@ -30,13 +30,13 @@
 ## 用法
 
     # 最常用：先读当前开机号，然后等它 +1（部署脚本这么用）
-    python3 pc/nxc_wait_boot.py
+    PYTHONPATH=pc/src python3 -m nxc_host.boot
 
     # 只想看一眼现在的状态
-    python3 pc/nxc_wait_boot.py --once
+    PYTHONPATH=pc/src python3 -m nxc_host.boot --once
 
     # 明确等某个开机号
-    python3 pc/nxc_wait_boot.py --expect-boot 149
+    PYTHONPATH=pc/src python3 -m nxc_host.boot --expect-boot 149
 退出码：0=等到；1=超时（并已尝试找设备）；2=一开始就连不上。
 """
 from __future__ import annotations
