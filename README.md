@@ -7,7 +7,7 @@
 当前设备源码提供 14 个工具 / 59 个方法（已安装版本以 `nxc caps` 为准），监听 TCP `47800`。PC 侧使用一个 `nxc` 入口和一个本机后台，
 CLI、MCP（8 个工具）和 Web 共用设备连接、FTP 客户端及 GDB 会话；无需额外桌面壳，也不用拔卡。
 
-当前 PC 版本 **v1.0.3**，版本号定义在仓库根目录的 [`VERSION`](VERSION)。设备源码与保留成品分开管理；本次更新内容及验证边界见 [CHANGELOG.md](CHANGELOG.md)。
+当前 PC 版本 **v1.0.3**，版本号定义在仓库根目录的 [`VERSION`](VERSION)。设备源码与保留成品分开管理，区别见下方构建说明。
 
 ## 设计要点
 
@@ -65,7 +65,7 @@ docker run --rm -v "$PWD":/work -w /work/device/platform \
   bash -lc '. /opt/devkitpro/devkita64.sh && make -j4'
 ```
 
-产出 `nxc.nsp`（ExeFS PFS0 格式）。`device/platform/dist/` 保留更新前主分支的设备成品，**不是当前源码的构建**；本次不发布尚未真机验收的新设备候选。具体摘要和能力边界见 [设备成品说明](device/platform/dist/README.md)。
+产出 `nxc.nsp`（ExeFS PFS0 格式）。`device/platform/dist/` 保留更新前主分支的设备成品，**不是当前源码的构建**；本次不发布尚未真机验收的新设备候选。该成品为旧版14工具54方法，长度229103字节，SHA-256 为 `fc5645d6ba53d8f4240d40a1f6e7aff034bb57b1b01af500dcaff2487f4e4a8d`；新设备源码须完成目标固件验收后再替换发行成品。
 `nxc-recovery` 是独立的小程序，在 `tools/nxc-recovery/` 里用同样的命令构建。
 
 ## 装到卡上
@@ -154,7 +154,15 @@ Web 包含概览、画面与控制、文件、调试、能力和日志六个页�
 
 安装通过已在线的 NXC `fs` 完成，不依赖尚未安装的 FTP，兼容当前旧 NXC 的 381B分块。启动标记最后写入，缺少必要接口或可用空标记来源时写前拒绝并说明原因。已有模块不覆盖升级；不明模块或来源不明的FTP占用端口时停止安装，现有文件传输仍可使用。
 
-官方包下载后在 PC 缓存并校验固定 SHA-256，本地 ZIP 上限4MiB，不直接解压到SD；本项目不随包分发第三方模块。版本、来源、摘要和恢复路径可在卡片详情中查看。需要 NXC 已安装并在线；不代表可在未安装任何设备模块的主机上直接远程部署。设计及已验证边界见 [FTP_SETUP.md](FTP_SETUP.md)。
+后台服务来自官方固定包，ZIP长度130642字节，SHA-256为
+`004e157224f105902b0952e9bdcb0872f5e23c1962985a4bc14aa62f1921febc`；
+模块目录为 `/atmosphere/contents/420000000000000E/`。
+导入包逐项核验固定内容，拒绝路径穿越、符号链接、重复文件及超限解压。
+安装先暂存并回读核验，配置修改前备份；失败报告已写路径和恢复路径，不自动重放未知写入。
+文件存在但端口未开标为待加载，登录失败提示配置，NXC查询失败标为未知。
+官方说明适配固件19.0.0与Atmosphère1.8.0；固件22.5.0已验证该模块登录和读取，其他组合需自行验证。
+
+官方包下载后在 PC 缓存并校验固定 SHA-256，本地 ZIP 上限4MiB，不直接解压到SD；本项目不随包分发第三方模块。版本、来源、摘要和恢复路径可在卡片详情中查看。需要 NXC 已安装并在线；不代表可在未安装任何设备模块的主机上直接远程部署。首次安装已由隔离旧设备替身验证，真机只验证已有后台服务的检测与复用，尚未验收首次安装。
 
 ### 命令行操作
 
@@ -185,7 +193,12 @@ FTP 客户端集成在 PC 后台，Switch 仍需运行 FTPD；PC 不另开 FTP �
 选定通道后失败不自动降级、不重放写入；仅 FTP 只读预检可在空闲连接失效后重新连接一次。
 上传和部署先暂存、核验 SHA-256 与长度，再保留旧文件备份并提交；新版 fs 使用设备摘要，旧 fs 使用流式读回。
 FTP 已支持旧设备模块上的文件传输；fs 上传仍需要 `fs.rename replace/rollback` 接口。
-CLI 上传下载逐块处理文件，Web 保留 8 MiB 上限；断点续传尚未提供。详细设计见 [TRANSFER.md](TRANSFER.md)。
+FTP使用标准库 `ftplib` 的被动二进制模式；目录优先MLSD，缺少时使用NLST/SIZE/CWD，不把任意550错误视为文件不存在。
+fs仅在有效的 `fs.transfer_info` / `fs.sha256` 能力声明后启用最多两条在途请求；旧设备单条传输。
+能力协商异常或传输中断直接报错，已发送但未确认的修改视为结果未知。
+上传提交失败尝试恢复旧目标，无法确认时报告暂存与备份路径；直接 `fs.write` 仍是原地写入，不能替代部署流程。
+
+CLI 上传下载逐块处理文件，Web 保留 8 MiB 上限；断点续传尚未提供。下载先写本地临时文件，完整验证后才替换目标；失败保留本地原文件。
 `deploy` 只发布文件，不自动重启。`boot --once` 查询当前开机号；
 不带 `--once` 时默认等待当前开机号增加，也可用 `--expect-boot` 指定目标，命令本身不会重启设备。
 see/step 图片由 CLI 写入本机，未指定 `--output` 时保存到配置目录的 `downloads/`，终端不打印整段 base64。
@@ -288,7 +301,11 @@ CLI、Web 和其他 MCP 客户端可继续使用；统一停止使用 `nxc stop`
 | 500 | 执行失败 |
 | 503 | 依赖的系统服务当前不可用，例如网络或 SD 卡未就绪 |
 
-完整规范（转义细节、分页、怎么新增一个工具）在 `device/platform/README.md`。
+没有 `=` 的请求参数按位置记为 `_0`、`_1` 等；请求以换行结束。结构化载荷一行可包含多个 `k=v`，
+二进制使用 base64。超长、重复或过量参数会被拒绝。
+
+能力发现使用 `tools.list [tool=<工具名>]`；教程使用 `tools.doc name=<工具[.方法]> [offset=] [lines=]`。
+工具参数、确认口令及分页范围以设备返回的教程为准。
 
 ## 安全边界
 
@@ -338,7 +355,7 @@ CLI、Web 和其他 MCP 客户端可继续使用；统一停止使用 `nxc stop`
 ## 目录
 
 ```
-device/platform/      设备侧 sysmodule：源码（核心 + 各工具）、构建脚本、详细手册、主分支保留的旧设备成品及安装配套文件（部署与验收状态见 MAINTAINING.md）
+device/platform/      设备侧 sysmodule：核心、工具、SDK、构建脚本与保留的旧设备成品
 tools/nxc-recovery/   独立小程序
 nxc                   PC 源码树统一入口
 pc/src/nxc_host/      配置、后台、设备工具、GDB、CLI/MCP 和 Web 资源
@@ -346,14 +363,71 @@ pc/build_app.py       标准库 zipapp 构建入口，产出 pc/dist/nxc
 pc/tests/            无设备回归；manual/ 为手动测试，不是产品入口
 skills/               本项目的开发流程约定（改动留痕、崩溃取证工具链）
 tests/                可复用宿主回归与统一检查入口
-MAINTAINING.md        当前架构、验证边界及问题修复记录
 ```
 
-加工具直接改 `device/platform/source/tools/`：每个工具的参数、风险等级、教程都写在它自己的 `.cpp` 里
-（样板见 `tool_fs.cpp` 末尾）。想知道这个平台现在会什么，问设备自己：`tools.list`。
+## 开发与验证
 
-修改后在仓库根目录执行 `python3 tests/run_checks.py`；该入口离线运行 Python 回归、
-宿主 C++ 测试和监听恢复检查。设备交叉编译及真机验证边界见 [维护说明](MAINTAINING.md)。
+PC 的 `config.py` / `client.py` 管理配置与后台启动，`runtime.py` / `daemon.py` 持有共享会话并提供本机HTTP服务，
+`device.py` 负责设备协议，`services/` 管理文件、FTP和GDB，`mcp.py` / `web/` 提供客户端入口。
+请求在执行锁内复核后台实例和目标配置；退出先标记关闭，再释放资源，避免排队操作在退出后继续执行。
+
+设备核心位于 `device/platform/source/core/`，负责注册、协议、网络、日志、睡眠与队列；
+工具位于 `source/tools/`，SDK为 `device/platform/include/nxc_sdk.hpp`。
+网络循环与串行工作线程分开，队列容量8，每客户端最多2条未完成请求；连接代次防止旧应答发给新连接。
+慢客户端不会无限阻塞其他连接。独立连接发送 `cancel` 可请求取消，但不能强制中断同步系统IPC，也不承诺回滚已执行修改。
+
+### 新增设备工具
+
+在 `device/platform/source/tools/` 新建文件即可，无需改核心清单或Makefile：
+
+```cpp
+#include "nxc_sdk.hpp"
+namespace {
+void echo(const nxc::Args& a, nxc::Reply& r) {
+    const char* text = a.get("text");
+    if (!text) { r.fail(400, "missing-text"); return; }
+    r.kv("echo", text);
+}
+const nxc::Method methods[] = {{"echo", "回显 text= 参数", echo}};
+}
+NXC_DEFINE_TOOL(nxc_tool_echo, "echo", "示例工具", methods);
+```
+
+工具描述符由链接器的 `nxc_tools` 段自动收集。正式工具应补齐 `nxc::Param[]`、`nxc::MethodInfo` 的风险等级与教程，
+并使用 `NXC_DEFINE_TOOL_EX` 提供工具级说明，参考 `tool_fs.cpp` 末尾。
+耗时循环调用 `nxc::host::operationCancelled()`；有副作用前用 `host::breadcrumb()` 记录进度，诊断日志用 `host::log()`。
+
+### 离线检查
+
+```bash
+python3 -W error tests/run_checks.py
+python3 pc/build_app.py --output pc/dist/nxc
+python3 pc/dist/nxc --version
+```
+
+检查需要Python3.10+、C++17编译器及POSIX；运行Python回归、6个独立C++程序、死连接、监听恢复和文案检查，不连接真实设备。
+设备交叉编译使用上方固定镜像，验收构建应指定全新目录，例如 `make BUILD=build-check -j2`，避免旧对象掩盖变化。
+CI运行宿主回归、构建PC运行包并交叉编译设备；不会自动覆盖 `dist/exefs.nsp`。
+
+### 故障排查
+
+| 现象 | 排查方法 |
+| --- | --- |
+| 无心跳、端口不通 | 核对模块目录、`flags/boot2.flag` 和网络配置；查看 `/atmosphere/fatal_errors/` 是否有转储 |
+| 有心跳、端口不通 | 查看 `/config/nxc/boot_progress.txt` 最后一行；确认设备醒着且 `net_mode=listen`、`psc_mode=close` |
+| 端口通但无应答 | 用 `identify.id` 核对实际服务状态与开机号，不能只凭TCP握手判为启动完成 |
+| 需要恢复模块 | 使用前述 `nxc-recovery`，或离线换回已知可用成品；停用可移走模块启动标记 |
+
+`/config/nxc/heartbeat.txt` 记录心跳，`boot_progress.txt` 保存最近进度；内存环形日志通过 `log.dump` 读取，重启会丢失。
+崩溃可用匹配该构建的 `nxc.elf` 和 `aarch64-none-elf-addr2line -e nxc.elf -f -C <偏移>` 定位。
+
+### v1.0.3 更新与验证范围（2026-10-27）
+
+- PC入口统一为 `nxc` 和共享后台，增加Web、GDB MI2会话管理、流式文件双通道及后台FTP向导。
+- 设备源码完善有界队列、取消与监听恢复、文件分页/摘要/提交、存档身份与完整备份校验。
+- 修复断线重放修改、旧目标请求误发、上传校验与备份恢复、GDB超时及资源占用状态问题。
+- macOS与Linux各235项测试、独立C++及网络回归、设备交叉编译和PC运行包冒烟通过。
+- 宿主测试与构建不代替真机验收；新设备源码、存档恢复及掉电恢复仍需对应设备验证。
 
 ## 许可
 

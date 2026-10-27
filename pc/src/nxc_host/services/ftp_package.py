@@ -20,7 +20,7 @@ FLAG_PATH = 'atmosphere/contents/420000000000000E/flags/boot2.flag'
 TOOLBOX_PATH = 'atmosphere/contents/420000000000000E/toolbox.json'
 CONFIG_PATH = 'config/sys-ftpd/config.ini'
 
-# 来源：FTP_SETUP.md 及官方 1.0.5 ZIP。产品不携带 ZIP；本地重包仍须逐项一致。
+# 来源：根目录 README.md 及官方 1.0.5 ZIP。产品不携带 ZIP；本地重包仍须逐项一致。
 CATALOG = {
     'version': '1.0.5',
     'url': 'https://github.com/cathery/sys-ftpd/releases/download/1.0.5/sys-ftpd-1.0.5.zip',
